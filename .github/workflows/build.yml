@@ -12,15 +12,30 @@ jobs:
       - name: Recuperer le code
         uses: actions/checkout@v4
 
-      - name: Compiler l'APK avec Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      - name: Installer Python
+        uses: actions/setup-python@v5
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          python-version: "3.11"
+
+      - name: Installer les dependances systeme necessaires a Buildozer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk autoconf libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo6 \
+            cmake libffi-dev libssl-dev build-essential ccache
+
+      - name: Installer Buildozer
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython
+
+      - name: Compiler l'APK (peut prendre 20 a 40 min la premiere fois)
+        run: |
+          yes | buildozer android debug
 
       - name: Mettre l'APK a disposition en telechargement
         uses: actions/upload-artifact@v4
         with:
           name: poker-apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
