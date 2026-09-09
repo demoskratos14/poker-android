@@ -24,6 +24,7 @@ import time
 import contextlib
 import html
 import json as json_module
+import threading
 import urllib.request
 import urllib.error
 from flask import Flask, request, redirect, url_for
@@ -226,6 +227,29 @@ def _relay_broadcast(messages, label):
         else:
             log_parts.append(f"[{label} -> {ai_type}] envoye avec succes.")
     return "\n".join(log_parts)
+
+
+_relay_log_lock = threading.Lock()
+
+
+def _relay_broadcast_async(messages, label):
+    """Version non-bloquante de _relay_broadcast : lance l'envoi dans un
+    thread separe et revient tout de suite, sans faire attendre
+    l'utilisateur (creation de partie, nouvelle main...) le temps que le
+    relais PC tape et attende la reponse de chaque IA - ce qui peut prendre
+    jusqu'a 90s par IA, voire echouer/trainer si le relais n'est pas
+    joignable. Le resultat est ajoute a LAST_LOG des qu'il est connu (donc
+    visible au prochain rafraichissement de la page), sans jamais bloquer
+    l'action en cours (creer la partie, distribuer une main...)."""
+    def _worker():
+        log = _relay_broadcast(messages, label)
+        if log is None:
+            return
+        global LAST_LOG
+        with _relay_log_lock:
+            LAST_LOG = (LAST_LOG + "\n\n" + log) if LAST_LOG else log
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _index_path():
@@ -1944,19 +1968,17 @@ def setup():
                 shared_name_pool=shared_name_pool,
             )
 
-        # Si un relais PC est configure : envoie automatiquement le prompt
+        # Si un relais PC est configure : envoie automatiquement (en
+        # arriere-plan, sans bloquer la creation de la partie) le prompt
         # d'instructions + la table de correspondance a chaque IA geant des
-        # bots sur "ma table", en plus des boutons "Copier" habituels
-        # (jusqu'ici c'etait uniquement copiable a la main, jamais envoye).
-        global LAST_LOG
+        # bots sur "ma table", en plus des boutons "Copier"/"Envoyer"
+        # habituels.
         controllers_to_notify = sorted(set(
             p["controller"] for p in game.players if not p["is_human"]
         ))
         if controllers_to_notify:
             setup_message = AI_PROMPT_TEXT.strip() + "\n\n" + game.code_table_text()
-            log = _relay_broadcast({c: setup_message for c in controllers_to_notify}, "Prompt+table")
-            if log is not None:
-                LAST_LOG = log
+            _relay_broadcast_async({c: setup_message for c in controllers_to_notify}, "Prompt+table")
 
         return redirect(url_for("show_code_table", first="1"))
 
@@ -2145,6 +2167,9 @@ def show_ai_prompt():
       geant des bots, pour lui expliquer les regles du jeu et le format attendu.</p>
       <textarea id="promptbox" class="copybox" style="min-height:340px;" readonly>{AI_PROMPT_TEXT}</textarea>
       <button id="copybtn4" onclick="copyBox('promptbox','copybtn4')">Copier</button>
+      <form method="post" action="{url_for('do_relay_send_setup')}" style="display:inline;">
+        <button type="submit" class="secondary">Envoyer le prompt + la table via le relais</button>
+      </form>
       <a class="btn secondary" href="{url_for('table_view') if game.players else url_for('setup')}">&larr; Retour</a>
     </div>
     """
@@ -2197,10 +2222,42 @@ def show_code_table():
     <div class="card">{intro}
       <textarea id="codebox" class="copybox" readonly>{text}</textarea>
       <button id="copybtn" onclick="copyBox('codebox','copybtn')">Copier</button>
+      <form method="post" action="{url_for('do_relay_send_setup')}" style="display:inline;">
+        <button type="submit" class="secondary">Envoyer le prompt + la table via le relais</button>
+      </form>
       <a class="btn secondary" href="{url_for('table_view')}">Continuer vers la table &rarr;</a>
     </div>
     """
     return layout("Table de correspondance", body)
+
+
+@app.route("/relay_send_setup", methods=["POST"])
+def do_relay_send_setup():
+    """Renvoie a la demande (bouton "Envoyer... via le relais") le prompt
+    d'instructions + la table de correspondance a chaque IA geant des bots.
+    Utile si le relais n'etait pas encore configure au moment de la
+    creation de la partie (l'envoi automatique n'avait alors rien pu
+    faire), ou pour reessayer apres une erreur."""
+    controllers_to_notify = sorted(set(
+        p["controller"] for p in game.players if not p["is_human"]
+    ))
+    if controllers_to_notify:
+        setup_message = AI_PROMPT_TEXT.strip() + "\n\n" + game.code_table_text()
+        _relay_broadcast_async(
+            {c: setup_message for c in controllers_to_notify}, "Prompt+table (envoi manuel)"
+        )
+    return redirect(request.referrer or url_for("show_code_table"))
+
+
+@app.route("/relay_send_hand", methods=["POST"])
+def do_relay_send_hand():
+    """Renvoie a la demande (bouton "Renvoyer cette main via le relais") le
+    bloc de la main en cours (etat de la table + cartes) a chaque IA geant
+    des bots. Utile pour reessayer apres une erreur, ou si le relais a ete
+    configure/reconnecte apres que la main ait deja ete distribuee."""
+    if getattr(game, "last_blocks", None):
+        _relay_broadcast_async(dict(game.last_blocks), "Main en cours (envoi manuel)")
+    return redirect(request.referrer or url_for("table_view"))
 
 
 # ----------------------------------------------------------------------
@@ -2360,6 +2417,10 @@ def table_view():
     )
     controller_links += '<button class="secondary" id="promptbtn" onclick="copyPromptDirect(\'promptbtn\')">Copier le prompt IA</button> '
     controller_links += '<button class="secondary" id="codetablebtn" onclick="copyCodeTableDirect(\'codetablebtn\')">Copier la table de correspondance</button> '
+    controller_links += (
+        f'<form method="post" action="{url_for("do_relay_send_hand")}" style="display:inline;">'
+        f'<button type="submit" class="secondary">Renvoyer cette main via le relais</button></form> '
+    )
     controller_links += f'<script>const AI_BLOCKS = {blocks_json};\nconst AI_PROMPT_TEXT_JS = {ai_prompt_json};\nconst CODE_TABLE_TEXT_JS = {code_table_json};\n'
     controller_links += """
       function copyBlockDirect(controller, btnId){
@@ -2612,17 +2673,12 @@ def table_view():
 @app.route("/new_hand", methods=["POST"])
 def do_new_hand():
     run_captured(game.new_hand)
-    # Si un relais PC est configure : envoie automatiquement a chaque IA
-    # geant des bots le bloc de sa main (etat de la table + SES cartes
-    # chiffrees), jusqu'ici uniquement disponible via le bouton "Copier"
-    # (game.last_blocks n'etait jamais transmis au relais). Sans cet envoi,
-    # "Faire jouer les IA" n'envoyait que l'historique des actions
-    # (hand_summary_text), qui ne contient pas les cartes.
+    # Si un relais PC est configure : envoie automatiquement (en
+    # arriere-plan, sans bloquer l'affichage de la nouvelle main) a chaque
+    # IA geant des bots le bloc de sa main (etat de la table + SES cartes
+    # chiffrees).
     if getattr(game, "last_blocks", None):
-        global LAST_LOG
-        log = _relay_broadcast(dict(game.last_blocks), "Nouvelle main (cartes)")
-        if log is not None:
-            LAST_LOG = (LAST_LOG + "\n\n" + log) if LAST_LOG else log
+        _relay_broadcast_async(dict(game.last_blocks), "Nouvelle main (cartes)")
     return redirect(url_for("table_view"))
 
 
