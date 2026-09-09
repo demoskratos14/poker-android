@@ -2,6 +2,7 @@
 
 # (str) Titre de l'application, tel qu'affiche sous l'icone
 title = Poker
+icon.filename = %(source.dir)s/icon.png
 
 # (str) Nom du package (technique, sans espaces ni accents)
 package.name = pokerapp
