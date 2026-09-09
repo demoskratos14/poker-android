@@ -192,7 +192,7 @@ def build_default_name_pool():
 CONTROLLER_SHORTCUTS = {
     "0": "Humain",
     "1": "Claude",
-    "2": "Gemini",
+    "2": "Vibe",
     "3": "ChatGPT",
 }
 
@@ -663,7 +663,7 @@ class Game:
         for i in range(n):
             print(f"\n-- Joueur {i+1} --")
             raw_controller = input(
-                "Gere par : [0]=Humain, [1]=Claude, [2]=Gemini, [3]=ChatGPT "
+                "Gere par : [0]=Humain, [1]=Claude, [2]=Vibe, [3]=ChatGPT "
                 "(ou tapez un autre nom directement) : "
             ).strip()
             controller = CONTROLLER_SHORTCUTS.get(raw_controller, raw_controller)

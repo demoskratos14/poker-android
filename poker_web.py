@@ -94,13 +94,13 @@ def _ensure_games_dir():
 
 # ----------------------------------------------------------------------
 # Liste PERSISTANTE des types d'IA proposes a la creation d'une partie
-# (Claude/Gemini/ChatGPT par defaut). Ajouter ou supprimer une IA ici est
+# (Claude/Vibe/ChatGPT par defaut). Ajouter ou supprimer une IA ici est
 # definitif : ca modifie la liste proposee pour TOUTES les parties futures,
 # contrairement au champ "+ Nouvelle IA..." (ponctuel, un seul siege).
 # ----------------------------------------------------------------------
 
 AI_TYPES_PATH = os.path.join(GAMES_DIR, "_ai_types.json")
-DEFAULT_AI_TYPES = ["Claude", "Gemini", "ChatGPT"]
+DEFAULT_AI_TYPES = ["Claude", "Vibe", "ChatGPT"]
 
 
 def load_ai_types():
@@ -389,7 +389,7 @@ def _assign_balanced_ai_controllers(seat_controllers, auto_indices):
     completer/equilibrer la repartition plutot que l'ignorer. Si aucune
     IA n'a ete explicitement choisie nulle part sur la table (tous les
     sieges sont "Auto", ou tous sont "Humain"), on retombe sur les 3 IA
-    par defaut (Claude/Gemini/ChatGPT).
+    par defaut (Claude/Vibe/ChatGPT).
 
     A chaque siege "Auto" a pourvoir (dans un ordre tire au sort), l'IA
     choisie est tiree au hasard PARMI celles ayant actuellement le moins
@@ -532,8 +532,8 @@ def spawn_extra_tables(num_tables, n_players, stack, name_pool_raw, main_seat_co
 
     # Pool des types de controleurs IA presents a la table principale (le
     # controleur humain en est exclu). L'ordre/les proportions d'origine
-    # sont conserves : si 2 sieges sur 6 etaient geres par "Gemini", le pool
-    # comptera bien 2 fois "Gemini", pour respecter au mieux la meme
+    # sont conserves : si 2 sieges sur 6 etaient geres par "Vibe", le pool
+    # comptera bien 2 fois "Vibe", pour respecter au mieux la meme
     # repartition sur les autres tables.
     ai_pool = [c for c in main_seat_controllers
                if CONTROLLER_SHORTCUTS.get(c, c).lower() != "humain"]
