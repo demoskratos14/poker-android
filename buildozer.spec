@@ -39,7 +39,7 @@ fullscreen = 0
 # (list) Permissions Android necessaires.
 # INTERNET est indispensable meme pour un serveur en 127.0.0.1.
 android.permissions = INTERNET
-android.extra_manifest_application_arguments = android:usesCleartextTraffic="true"
+android.extra_manifest_application_arguments = %(source.dir)s/extra_manifest_application_arguments.txt
 
 # (int) API Android cible (laisser les valeurs par defaut recentes de Buildozer)
 #android.api = 33
