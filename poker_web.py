@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-""" INTERFACE WEB - Moteur de Poker ================================ A lancer avec Pydroid 3, en gardant poker_engine.py dans le MEME dossier. Installation (une seule fois) : pip install flask Lancement : Executez ce fichier (bouton Play dans Pydroid 3). Puis ouvrez votre navigateur sur : http://127.0.0.1:5000 L'etat de la partie est partage avec poker_engine.py (meme fichier poker_state.json) : vous pouvez utiliser l'un ou l'autre indifferemment. """
+"""
+INTERFACE WEB - Moteur de Poker
+================================
+A lancer avec Pydroid 3, en gardant poker_engine.py dans le MEME dossier.
+
+Installation (une seule fois) :
+    pip install flask
+
+Lancement :
+    Executez ce fichier (bouton Play dans Pydroid 3).
+    Puis ouvrez votre navigateur sur : http://127.0.0.1:5000
+
+L'etat de la partie est partage avec poker_engine.py (meme fichier
+poker_state.json) : vous pouvez utiliser l'un ou l'autre indifferemment.
+"""
 
 import io
 import math
@@ -21,384 +35,6 @@ from poker_engine import (
     SUITS, RANK_NAMES, best_hand_with_cards, describe,
     order_cards_for_display,
 )
-
-# Structures de tournoi predefinies, inspirees de vrais circuits de poker.
-# hands_per_level remplace la notion de "minutes par niveau" (impossible a
-# reproduire ici) : les blinds/antes doublent toutes les N mains.
-TOURNAMENT_PRESETS = {
-    "wsop": {
-        "label": "Lent (style WSOP Main Event)",
-        "description": (
-            "Tapis tres profond (300 grosses blindes), niveaux tres longs. "
-            "Le vrai WSOP Main Event demarre a 60 000 jetons avec des blindes "
-            "100/200 et des niveaux de 2h : un format qui recompense la patience."
-        ),
-        "stack": 60000, "small_blind": 100, "big_blind": 200, "ante": 25,
-        "hands_per_level": 20,
-    },
-    "ept": {
-        "label": "Modere (style EPT / circuits majeurs)",
-        "description": (
-            "Tapis profond (environ 150 grosses blindes), rythme intermediaire "
-            "typique des grands circuits comme l'European Poker Tour ou le WPT."
-        ),
-        "stack": 30000, "small_blind": 100, "big_blind": 200, "ante": 25,
-        "hands_per_level": 12,
-    },
-    "turbo": {
-        "label": "Rapide (turbo)",
-        "description": (
-            "Tapis court (environ 50 grosses blindes) et blindes qui montent "
-            "vite : parties courtes et agressives, ideal pour une session rapide."
-        ),
-        "stack": 10000, "small_blind": 100, "big_blind": 200, "ante": 10,
-        "hands_per_level": 6,
-    },
-    "custom": {
-        "label": "Personnalise",
-        "description": "Choisissez vous-meme tous les reglages ci-dessous.",
-        "stack": 50000, "small_blind": 100, "big_blind": 200, "ante": 10,
-        "hands_per_level": 10,
-    },
-}
-
-app = Flask(__name__)
-
-# ----------------------------------------------------------------------
-# Gestion multi-parties : chaque partie a son propre fichier de sauvegarde,
-# un petit registre garde la liste des parties + laquelle est active.
-# ----------------------------------------------------------------------
-
-GAMES_DIR = "poker_games"
-LEGACY_SAVE_FILE = "poker_state.json"  # ancien fichier unique (avant les onglets)
-_GAME_CACHE = {}  # gid -> instance Game deja chargee (evite de relire le disque a chaque requete)
-
-
-def _ensure_games_dir():
-    os.makedirs(GAMES_DIR, exist_ok=True)
-
-
-# ----------------------------------------------------------------------
-# Liste PERSISTANTE des types d'IA proposes a la creation d'une partie
-# (Claude/Gemini/ChatGPT par defaut). Ajouter ou supprimer une IA ici est
-# definitif : ca modifie la liste proposee pour TOUTES les parties futures,
-# contrairement au champ "+ Nouvelle IA..." (ponctuel, un seul siege).
-# ----------------------------------------------------------------------
-
-AI_TYPES_PATH = os.path.join(GAMES_DIR, "_ai_types.json")
-DEFAULT_AI_TYPES = ["Claude", "Gemini", "ChatGPT"]
-
-
-def load_ai_types():
-    _ensure_games_dir()
-    if os.path.exists(AI_TYPES_PATH):
-        try:
-            with open(AI_TYPES_PATH, "r", encoding="utf-8") as f:
-                types = json_module.load(f)
-            if isinstance(types, list) and types:
-                return types
-        except (json_module.JSONDecodeError, OSError, UnicodeDecodeError):
-            pass
-    return list(DEFAULT_AI_TYPES)
-
-
-def save_ai_types(types):
-    _ensure_games_dir()
-    with open(AI_TYPES_PATH, "w", encoding="utf-8") as f:
-        json_module.dump(types, f, ensure_ascii=False, indent=2)
-
-
-def add_ai_type(name):
-    name = name.strip()
-    if not name:
-        return
-    types = load_ai_types()
-    if name not in types:
-        types.append(name)
-        save_ai_types(types)
-
-
-def remove_ai_type(name):
-    types = load_ai_types()
-    types = [t for t in types if t != name]
-    if not types:
-        types = list(DEFAULT_AI_TYPES)  # ne jamais rester sans aucune IA proposee
-    save_ai_types(types)
-
-
-# ----------------------------------------------------------------------
-# Relais PC : au lieu de copier-coller manuellement le resume de main
-# dans chaque IA, l'app peut interroger un petit serveur qui tourne sur
-# le PC de l'utilisateur (voir dossier relay/). Ce serveur garde des
-# conversations ouvertes (navigateur) avec chaque IA et fait le
-# copier-coller a sa place. L'adresse de ce serveur (ex: son IP locale
-# sur le meme Wi-Fi) est enregistree ici.
-# ----------------------------------------------------------------------
-
-RELAY_CONFIG_PATH = os.path.join(GAMES_DIR, "_relay_config.json")
-
-
-def load_relay_config():
-    _ensure_games_dir()
-    if os.path.exists(RELAY_CONFIG_PATH):
-        try:
-            with open(RELAY_CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json_module.load(f)
-            if isinstance(cfg, dict):
-                return cfg
-        except (json_module.JSONDecodeError, OSError, UnicodeDecodeError):
-            pass
-    return {"relay_url": ""}
-
-
-def save_relay_config(cfg):
-    _ensure_games_dir()
-    with open(RELAY_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json_module.dump(cfg, f, ensure_ascii=False, indent=2)
-
-
-def ask_relay_for_action(ai_type, message, timeout=90):
-    """Envoie le resume de main au relais PC pour le compte de l'IA `ai_type`, et retourne (reponse_brute, erreur). En cas de succes, erreur est None. En cas d'echec (relais non configure, injoignable, IA non geree, etc.), reponse_brute est None et erreur decrit le probleme pour affichage a l'utilisateur."""
-    cfg = load_relay_config()
-    relay_url = (cfg.get("relay_url") or "").rstrip("/")
-    if not relay_url:
-        return None, "Aucun relais PC configure. Va dans 'Configurer le relais IA' pour renseigner son adresse."
-
-    payload = json_module.dumps({"ai": ai_type, "message": message}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{relay_url}/ask",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json_module.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as e:
-        return None, f"Impossible de joindre le relais PC ({relay_url}) : {e}"
-    except (TimeoutError, OSError) as e:
-        return None, f"Le relais PC n'a pas repondu a temps : {e}"
-    except (json_module.JSONDecodeError, ValueError) as e:
-        return None, f"Reponse invalide du relais PC : {e}"
-
-    if "error" in body:
-        return None, f"Le relais PC a renvoye une erreur pour {ai_type} : {body['error']}"
-    reply = body.get("reply")
-    if not reply:
-        return None, f"Le relais PC n'a renvoye aucun texte pour {ai_type}."
-    return reply, None
-
-
-def _relay_broadcast(messages, label):
-    """Envoie un message different a chaque IA (dict {controleur: texte}) via le relais PC, de facon synchrone (le relais ne gere qu'une requete Playwright a la fois de toute facon - voir relay_server.py). Ne fait rien si aucun relais n'est configure (retourne None) : ca reste donc sans effet pour qui n'utilise pas le relais et continue au copier-coller manuel. Sinon, retourne un texte de journal resumant chaque envoi, a ajouter a LAST_LOG pour que l'utilisateur voie ce qui a ete transmis et si une IA n'a pas ete jointe."""
-    cfg = load_relay_config()
-    if not (cfg.get("relay_url") or "").strip():
-        return None
-    log_parts = []
-    for ai_type, text in messages.items():
-        reply, error = ask_relay_for_action(ai_type, text)
-        if error:
-            log_parts.append(f"[{label} -> {ai_type}] ERREUR : {error}")
-        else:
-            log_parts.append(f"[{label} -> {ai_type}] envoye avec succes.")
-    return "\n".join(log_parts)
-
-
-_relay_log_lock = threading.Lock()
-
-
-def _relay_broadcast_async(messages, label):
-    """Version non-bloquante de _relay_broadcast : lance l'envoi dans un thread separe et revient tout de suite, sans faire attendre l'utilisateur (creation de partie, nouvelle main...) le temps que le relais PC tape et attende la reponse de chaque IA - ce qui peut prendre jusqu'a 90s par IA, voire echouer/trainer si le relais n'est pas joignable. Le resultat est ajoute a LAST_LOG des qu'il est connu (donc visible au prochain rafraichissement de la page), sans jamais bloquer l'action en cours (creer la partie, distribuer une main...)."""
-    def _worker():
-        log = _relay_broadcast(messages, label)
-        if log is None:
-            return
-        global LAST_LOG
-        with _relay_log_lock:
-            LAST_LOG = (LAST_LOG + "\n\n" + log) if LAST_LOG else log
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def _index_path():
-    return os.path.join(GAMES_DIR, "_index.json")
-
-
-def _rebuild_index_from_disk():
-    """Reconstruit un registre minimal a partir des fichiers de parties presents dans GAMES_DIR, utilise quand _index.json est illisible/corrompu. Chaque partie vit dans son PROPRE fichier ({gid}.json, voir _game_file) : perdre _index.json ne perd donc pas les parties elles-memes, seulement la liste/l'ordre/le nom affiche et la notion de "partie active", que l'on peut retrouver en listant simplement les fichiers presents."""
-    _ensure_games_dir()
-    games = []
-    for fname in sorted(os.listdir(GAMES_DIR)):
-        if fname == "_index.json" or not fname.endswith(".json"):
-            continue
-        gid = fname[:-len(".json")]
-        games.append({"id": gid, "name": f"Partie recuperee ({gid})"})
-    return {"games": games, "active": (games[0]["id"] if games else None)}
-
-
-def _load_index():
-    _ensure_games_dir()
-    path = _index_path()
-    if not os.path.exists(path):
-        return {"games": [], "active": None}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            idx = json_module.load(f)
-        if not isinstance(idx, dict) or "games" not in idx:
-            raise ValueError("structure du registre invalide (cle 'games' absente)")
-        return idx
-    except (json_module.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as e:
-        # Un _index.json corrompu (arret brutal, disque plein...) ne doit
-        # jamais faire planter l'application web sur CHAQUE requete. On met
-        # le fichier fautif de cote pour recuperation manuelle eventuelle,
-        # puis on reconstruit un registre minimal en scannant les fichiers
-        # de parties encore presents sur le disque : aucune partie n'est
-        # perdue, seuls les noms personnalises et l'ordre d'affichage le
-        # sont eventuellement.
-        backup_path = f"{path}.corrompu.{int(time.time())}"
-        try:
-            os.replace(path, backup_path)
-            hint = f"une copie a ete conservee sous : {backup_path}"
-        except OSError:
-            hint = "impossible de conserver une copie du fichier fautif"
-        print(f"\n/!\\ ATTENTION : registre des parties illisible/corrompu ({e}).")
-        print(f" {hint}")
-        rebuilt = _rebuild_index_from_disk()
-        print(f" Reconstruction automatique depuis les fichiers de parties presents sur "
-              f"disque : {len(rebuilt['games'])} partie(s) retrouvee(s).\n")
-        _save_index(rebuilt)
-        return rebuilt
-
-
-def _save_index(idx):
-    _ensure_games_dir()
-    # Ecriture atomique (fichier temporaire + os.replace) : evite qu'une
-    # interruption pendant l'ecriture ne laisse _index.json tronque/corrompu,
-    # meme pattern que pour la sauvegarde de chaque partie (Game.save()).
-    path = _index_path()
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json_module.dump(idx, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
-
-
-def _game_file(gid):
-    return os.path.join(GAMES_DIR, f"{gid}.json")
-
-
-def _get_game_instance(gid):
-    if gid not in _GAME_CACHE:
-        g = Game(save_file=_game_file(gid))
-        g.load()
-        _GAME_CACHE[gid] = g
-    return _GAME_CACHE[gid]
-
-
-def create_game(name, migrate_from=None, tournament_id=None):
-    """Cree une nouvelle partie (avec son propre fichier), l'enregistre dans le registre et la rend active. Si migrate_from est fourni (utilise une seule fois, pour recuperer l'ancien fichier unique poker_state.json), la partie existante y est recopiee au lieu de partir de zero. tournament_id : si fourni, regroupe cette partie avec toutes les autres parties portant le meme identifiant (utilise pour les tournois multi-table, afin de savoir quelles tables sont "annexes" les unes des autres et synchroniser leurs eliminations - voir spawn_extra_tables et _sync_satellite_eliminations)."""
-    idx = _load_index()
-    gid = f"partie_{len(idx['games']) + 1}_{int(time.time())}"
-    entry = {"id": gid, "name": name}
-    if tournament_id:
-        entry["tournament_id"] = tournament_id
-    idx["games"].append(entry)
-    idx["active"] = gid
-    _save_index(idx)
-
-    if migrate_from and os.path.exists(migrate_from):
-        g = Game(save_file=migrate_from)
-        g.load()
-        g.save_file = _game_file(gid)
-        g.save()
-    else:
-        g = Game(save_file=_game_file(gid))
-        g.save()
-    _GAME_CACHE[gid] = g
-    return gid
-
-
-def _assign_balanced_ai_controllers(seat_controllers, auto_indices):
-    """Remplace en place, dans seat_controllers, les sieges marques a None (aucun role explicitement choisi par l'utilisateur pour ce siege - controleur "Auto" laisse tel quel dans le formulaire) par une IA choisie aleatoirement, tout en equilibrant au mieux le nombre de sieges attribues a chaque IA. Le pool d'IA utilise pour cet equilibrage est celui des IA deja explicitement choisies pour d'AUTRES sieges de la meme table (dans leurs proportions d'origine - le compte de depart de chaque IA tient compte de ces choix explicites) : les sieges "Auto" viennent ainsi completer/equilibrer la repartition plutot que l'ignorer. Si aucune IA n'a ete explicitement choisie nulle part sur la table (tous les sieges sont "Auto", ou tous sont "Humain"), on retombe sur les 3 IA par defaut (Claude/Gemini/ChatGPT). A chaque siege "Auto" a pourvoir (dans un ordre tire au sort), l'IA choisie est tiree au hasard PARMI celles ayant actuellement le moins de sieges deja attribues (egalite departagee au hasard) : le resultat reste aleatoire tout en gardant les compteurs aussi equilibres que possible au fil de l'attribution."""
-    if not auto_indices:
-        return
-    explicit_ai = [
-        CONTROLLER_SHORTCUTS.get(c, c) for c in seat_controllers
-        if c is not None and CONTROLLER_SHORTCUTS.get(c, c).lower() != "humain"
-    ]
-    ai_pool = sorted(set(explicit_ai)) if explicit_ai else load_ai_types()
-    counts = {a: explicit_ai.count(a) for a in ai_pool}
-    order = list(auto_indices)
-    random.shuffle(order)
-    for i in order:
-        min_count = min(counts.values())
-        candidates = [a for a in ai_pool if counts[a] == min_count]
-        chosen = random.choice(candidates)
-        counts[chosen] += 1
-        seat_controllers[i] = chosen
-
-
-def _is_satellite_table(gm):
-    """Renvoie True si cette entree du registre est une table ANNEXE d'un tournoi multi-table (IA uniquement, generee par spawn_extra_tables), par opposition a la table principale (celle du joueur humain) ou a une partie autonome hors tournoi. La table principale se voit attribuer, au moment du passage en multi-table, un tournament_id egal a son PROPRE id (voir spawn_extra_tables) ; les tables annexes, elles, ont un tournament_id qui pointe vers cet id principal mais different du leur. C'est ce qui permet de les distinguer sans ambiguite."""
-    tid = gm.get("tournament_id")
-    return bool(tid) and tid != gm["id"]
-
-
-def _purge_orphaned_satellites():
-    """Nettoie les tables ANNEXES devenues orphelines : celles dont le tournament_id ne correspond plus a AUCUNE table principale presente dans le registre (parce que cette table principale a ete supprimee - y compris via une ancienne version du code qui ne retirait pas encore ses annexes en meme temps - ou parce qu'un equilibrage les a fermees et qu'elles ne servent plus a rien). Sans ce nettoyage, ces entrees orphelines restent indefiniment dans _index.json (avec leur fichier .json correspondant) : invisibles dans les onglets (voir render_game_tabs), mais toujours candidates pour devenir "active" par defaut - c'est exactement ce qui cree une "partie fantome" quand on supprime sa derniere vraie partie. Appelee a chaque chargement de page (avant get_active_game), donc les orphelins deja presents sont purges automatiquement, sans manipulation de l'utilisateur."""
-    idx = _load_index()
-    known_ids = {gm["id"] for gm in idx["games"]}
-    orphans = [
-        gm for gm in idx["games"]
-        if _is_satellite_table(gm) and gm.get("tournament_id") not in known_ids
-    ]
-    if not orphans:
-        return
-    orphan_ids = {gm["id"] for gm in orphans}
-    idx["games"] = [gm for gm in idx["games"] if gm["id"] not in orphan_ids]
-    if idx.get("active") in orphan_ids:
-        idx["active"] = None
-    _save_index(idx)
-    for oid in orphan_ids:
-        _GAME_CACHE.pop(oid, None)
-        try:
-            os.remove(_game_file(oid))
-        except OSError:
-            pass
-
-
-def get_active_game():
-    """Retourne l'instance Game de la partie actuellement active, en creant une premiere partie si le registre ne contient plus aucune VRAIE partie (avec recuperation automatique de l'ancien fichier unique s'il existe, pour ne pas perdre une partie en cours lors de la mise a jour vers le systeme d'onglets). Ne choisit jamais une table ANNEXE de tournoi comme partie active : ces tables ne sont pas navigables/jouables directement (voir _is_satellite_table), donc si le registre ne contient plus que ce genre de tables (orphelines ou non), on considere qu'il n'y a plus de partie du tout et on en recree une, exactement comme si le registre etait vide."""
-    _purge_orphaned_satellites()
-    idx = _load_index()
-    real_games = [gm for gm in idx["games"] if not _is_satellite_table(gm)]
-    if not real_games:
-        gid = create_game("Partie 1", migrate_from=LEGACY_SAVE_FILE)
-        return _get_game_instance(gid)
-    active = idx.get("active")
-    if not active or not any(gm["id"] == active for gm in real_games):
-        active = real_games[0]["id"]
-        idx["active"] = active
-        _save_index(idx)
-    return _get_game_instance(active)
-
-
-def list_games():
-    return _load_index()["games"]
-
-
-def set_active_game(gid):
-    idx = _load_index()
-    if any(gm["id"] == gid for gm in idx["games"]):
-        idx["active"] = gid
-        _save_index(idx)
-        return True
-    return False
-
-
-def spawn_extra_tables(num_tables, n_players, stack, name_pool_raw, main_seat_controllers, small_blind, big_blind, ante, hands_per_level, shared_name_pool=None):
-    """Cree automatiquement (num_tables - 1) tables supplementaires pour un tournoi multi-table : meme nombre de joueurs et meme structure (tapis, blindes, ante, niveaux) que la table principale ("ma table"). Les sieges de ces tables supplementaires sont repartis automatiquement entre les MEMES TYPES D'IA que ceux presents a la table principale (dans les memes proportions, en cyclant sur la liste si besoin). Le ou les sieges humains de la table princip)
 
 # Structures de tournoi predefinies, inspirees de vrais circuits de poker.
 # hands_per_level remplace la notion de "minutes par niveau" (impossible a
@@ -2185,9 +1821,13 @@ def _tournament_overview():
 
 @app.route("/")
 def index():
-    if not game.players:
-        return redirect(url_for("setup"))
-    return redirect(url_for("table_view"))
+    # La configuration du relais IA est desormais la toute premiere
+    # chose vue a l'ouverture de l'app : l'adresse est memorisee d'une
+    # fois sur l'autre (pre-remplie), donc dans l'immense majorite des
+    # cas il suffit de verifier/confirmer d'un coup d'oeil avant de
+    # continuer - mais ca evite d'oublier de la (re)configurer si elle
+    # a change (ex : PC redemarre avec une nouvelle IP locale).
+    return redirect(url_for("relay_settings"))
 
 
 @app.route("/games/switch/<gid>")
@@ -3191,6 +2831,7 @@ def relay_settings():
 
     cfg = load_relay_config()
     current = html.escape(cfg.get("relay_url", ""))
+    continue_url = url_for("table_view") if game.players else url_for("setup")
     body = f"""
     <div class="card">
       <h2 style="margin-top:0">Relais IA (PC)</h2>
@@ -3199,13 +2840,15 @@ def relay_settings():
       une adresse locale du style <code>http://192.168.1.XX:8765</code>,
       trouvable via l'IP affichee au demarrage du serveur sur ton PC.
       Ton telephone et ton PC doivent etre sur le meme reseau Wi-Fi.</p>
+      <p>Cette adresse est memorisee : verifie/modifie-la si besoin (par
+      exemple si ton PC a change d'adresse locale), puis continue.</p>
       <form method="post">
         <input type="text" name="relay_url" value="{current}"
                placeholder="http://192.168.1.XX:8765" style="width:100%;">
         <button style="margin-top:12px;">Enregistrer</button>
       </form>
       <p style="margin-top:20px;">
-        <a class="btn secondary" href="{url_for('table_view') if game.players else url_for('setup')}">&larr; Retour</a>
+        <a class="btn" href="{continue_url}">Continuer vers ma partie &rarr;</a>
       </p>
     </div>
     """
