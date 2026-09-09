@@ -192,6 +192,16 @@ def ask_relay_for_action(ai_type, message, timeout=90):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json_module.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # Le relais a repondu avec un code d'erreur (ex: 500) : on lit
+        # son corps de reponse JSON pour afficher le VRAI message
+        # explicatif (ex: "aucun des selecteurs connus n'a fonctionne")
+        # plutot que le generique "HTTP Error 500" peu utile.
+        try:
+            detail = json_module.loads(e.read().decode("utf-8")).get("error", str(e))
+        except (json_module.JSONDecodeError, ValueError, UnicodeDecodeError, AttributeError):
+            detail = str(e)
+        return None, f"Le relais PC a renvoye une erreur pour {ai_type} : {detail}"
     except urllib.error.URLError as e:
         return None, f"Impossible de joindre le relais PC ({relay_url}) : {e}"
     except (TimeoutError, OSError) as e:
