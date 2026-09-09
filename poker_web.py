@@ -206,6 +206,28 @@ def ask_relay_for_action(ai_type, message, timeout=90):
     return reply, None
 
 
+def _relay_broadcast(messages, label):
+    """Envoie un message different a chaque IA (dict {controleur: texte})
+    via le relais PC, de facon synchrone (le relais ne gere qu'une requete
+    Playwright a la fois de toute facon - voir relay_server.py). Ne fait
+    rien si aucun relais n'est configure (retourne None) : ca reste donc
+    sans effet pour qui n'utilise pas le relais et continue au copier-coller
+    manuel. Sinon, retourne un texte de journal resumant chaque envoi, a
+    ajouter a LAST_LOG pour que l'utilisateur voie ce qui a ete transmis et
+    si une IA n'a pas ete jointe."""
+    cfg = load_relay_config()
+    if not (cfg.get("relay_url") or "").strip():
+        return None
+    log_parts = []
+    for ai_type, text in messages.items():
+        reply, error = ask_relay_for_action(ai_type, text)
+        if error:
+            log_parts.append(f"[{label} -> {ai_type}] ERREUR : {error}")
+        else:
+            log_parts.append(f"[{label} -> {ai_type}] envoye avec succes.")
+    return "\n".join(log_parts)
+
+
 def _index_path():
     return os.path.join(GAMES_DIR, "_index.json")
 
@@ -1921,6 +1943,21 @@ def setup():
                 small_blind, big_blind, ante, hands_per_level,
                 shared_name_pool=shared_name_pool,
             )
+
+        # Si un relais PC est configure : envoie automatiquement le prompt
+        # d'instructions + la table de correspondance a chaque IA geant des
+        # bots sur "ma table", en plus des boutons "Copier" habituels
+        # (jusqu'ici c'etait uniquement copiable a la main, jamais envoye).
+        global LAST_LOG
+        controllers_to_notify = sorted(set(
+            p["controller"] for p in game.players if not p["is_human"]
+        ))
+        if controllers_to_notify:
+            setup_message = AI_PROMPT_TEXT.strip() + "\n\n" + game.code_table_text()
+            log = _relay_broadcast({c: setup_message for c in controllers_to_notify}, "Prompt+table")
+            if log is not None:
+                LAST_LOG = log
+
         return redirect(url_for("show_code_table", first="1"))
 
     ai_types = load_ai_types()
@@ -2575,6 +2612,17 @@ def table_view():
 @app.route("/new_hand", methods=["POST"])
 def do_new_hand():
     run_captured(game.new_hand)
+    # Si un relais PC est configure : envoie automatiquement a chaque IA
+    # geant des bots le bloc de sa main (etat de la table + SES cartes
+    # chiffrees), jusqu'ici uniquement disponible via le bouton "Copier"
+    # (game.last_blocks n'etait jamais transmis au relais). Sans cet envoi,
+    # "Faire jouer les IA" n'envoyait que l'historique des actions
+    # (hand_summary_text), qui ne contient pas les cartes.
+    if getattr(game, "last_blocks", None):
+        global LAST_LOG
+        log = _relay_broadcast(dict(game.last_blocks), "Nouvelle main (cartes)")
+        if log is not None:
+            LAST_LOG = (LAST_LOG + "\n\n" + log) if LAST_LOG else log
     return redirect(url_for("table_view"))
 
 
