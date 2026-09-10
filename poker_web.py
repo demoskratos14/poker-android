@@ -176,11 +176,17 @@ def ask_relay_for_action(ai_type, message, timeout=90):
     `ai_type`, et retourne (reponse_brute, erreur). En cas de succes,
     erreur est None. En cas d'echec (relais non configure, injoignable,
     IA non geree, etc.), reponse_brute est None et erreur decrit le
-    probleme pour affichage a l'utilisateur."""
+    probleme pour affichage a l'utilisateur.
+
+    Met egalement a jour RELAY_STATUS[ai_type] ("waiting" pendant
+    l'appel, puis "ok"/"error" selon le resultat), pour le voyant
+    affiche a cote du nom de l'IA sur la table."""
     cfg = load_relay_config()
     relay_url = (cfg.get("relay_url") or "").rstrip("/")
     if not relay_url:
         return None, "Aucun relais PC configure. Va dans 'Configurer le relais IA' pour renseigner son adresse."
+
+    _set_relay_status(ai_type, "waiting")
 
     payload = json_module.dumps({"ai": ai_type, "message": message}).encode("utf-8")
     req = urllib.request.Request(
@@ -201,19 +207,26 @@ def ask_relay_for_action(ai_type, message, timeout=90):
             detail = json_module.loads(e.read().decode("utf-8")).get("error", str(e))
         except (json_module.JSONDecodeError, ValueError, UnicodeDecodeError, AttributeError):
             detail = str(e)
+        _set_relay_status(ai_type, "error")
         return None, f"Le relais PC a renvoye une erreur pour {ai_type} : {detail}"
     except urllib.error.URLError as e:
+        _set_relay_status(ai_type, "error")
         return None, f"Impossible de joindre le relais PC ({relay_url}) : {e}"
     except (TimeoutError, OSError) as e:
+        _set_relay_status(ai_type, "error")
         return None, f"Le relais PC n'a pas repondu a temps : {e}"
     except (json_module.JSONDecodeError, ValueError) as e:
+        _set_relay_status(ai_type, "error")
         return None, f"Reponse invalide du relais PC : {e}"
 
     if "error" in body:
+        _set_relay_status(ai_type, "error")
         return None, f"Le relais PC a renvoye une erreur pour {ai_type} : {body['error']}"
     reply = body.get("reply")
     if not reply:
+        _set_relay_status(ai_type, "error")
         return None, f"Le relais PC n'a renvoye aucun texte pour {ai_type}."
+    _set_relay_status(ai_type, "ok")
     return reply, None
 
 
@@ -832,6 +845,44 @@ def delete_game(gid):
 game = None  # sera assigne automatiquement avant chaque requete (voir plus bas)
 LAST_LOG = ""
 
+# ----------------------------------------------------------------------
+# Statut du relais par IA, pour le voyant affiche a cote de chaque siege
+# IA sur la table : "waiting" (message envoye, reponse pas encore
+# recue - rouge), "ok" (derniere reponse recue avec succes - vert),
+# "error" (dernier envoi/reponse en echec - orange), ou absent du dict
+# (jamais sollicitee depuis le demarrage de l'app - gris). Reinitialise
+# a chaque redemarrage de l'app (etat en memoire seulement, pas persiste
+# sur disque : ce n'est qu'une indication visuelle du moment present).
+# ----------------------------------------------------------------------
+RELAY_STATUS = {}
+_relay_status_lock = threading.Lock()
+
+
+def _set_relay_status(ai_type, status):
+    with _relay_status_lock:
+        RELAY_STATUS[ai_type] = status
+
+
+def relay_status_dot_html(controller):
+    """Petit voyant colore (rouge/vert/orange/gris) refletant l'etat le
+    plus recent des echanges avec cette IA via le relais. Purement
+    visuel : n'affecte jamais le deroulement du jeu."""
+    status = RELAY_STATUS.get(controller)
+    if status == "waiting":
+        color, title = "#e05252", "En attente de la reponse de l'IA..."
+    elif status == "ok":
+        color, title = "#4caf50", "Derniere reponse recue avec succes."
+    elif status == "error":
+        color, title = "#e0a030", "Dernier envoi/reponse en echec - voir le journal."
+    else:
+        color, title = "#8a8a8a", "Pas encore sollicitee via le relais."
+    safe_title = html.escape(title)
+    return (
+        f'<span class="relay-dot" title="{safe_title}" '
+        f'style="display:inline-block;width:9px;height:9px;border-radius:50%;'
+        f'background:{color};margin-left:5px;vertical-align:middle;"></span>'
+    )
+
 
 @app.before_request
 def _load_active_game():
@@ -1331,13 +1382,14 @@ def render_poker_table(seats, pot=None, current_bets=None, unit_value=None, tier
         allin_tag = ' <span class="tag tag-allin">all-in</span>' if s.get("all_in") and not s.get("folded") else ""
         rank = s.get("rank", "-")
         rank_cls = " rank-lead" if rank == 1 else ""
+        controller_dot = "" if s.get("is_human") else relay_status_dot_html(s.get("controller", ""))
         seats_html += f"""
         <div class="{classes}" style="left:{x:.2f}%; top:{y:.2f}%;">
           <div class="seat-box">
             <div class="seat-pos-row"><span>{s.get('pos', '-')}</span>{pos_icon}</div>
             <div class="seat-name">{s['name']}{name_tag}{folded_tag}{allin_tag}</div>
             <div class="seat-info">
-              {s.get('controller', '-')}
+              {s.get('controller', '-')}{controller_dot}
               <span class="{rank_cls.strip()}">#{rank}</span><br>
               Tapis {s.get('stack', '-')}
             </div>
@@ -1751,7 +1803,7 @@ def render_game_tabs():
     return f'<div class="tabs-row">{tabs}</div>'
 
 
-def layout(title, body, corner_html=""):
+def layout(title, body, corner_html="", auto_refresh_seconds=None):
     # Note : on renvoie directement le HTML assemble (pas de moteur de
     # template). Auparavant ce bloc passait par Flask render_template_string,
     # qui re-interprete tout le texte en Jinja2 -- y compris "title" et
@@ -1762,10 +1814,14 @@ def layout(title, body, corner_html=""):
     # est deja une chaine Python normale ici, donc rien ne nous obligeait a
     # repasser par un moteur de template pour l'inserer.
     safe_title = html.escape(str(title))
+    refresh_tag = (
+        f'<meta http-equiv="refresh" content="{int(auto_refresh_seconds)}">'
+        if auto_refresh_seconds else ""
+    )
     return f"""
     <!DOCTYPE html><html lang="fr"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{safe_title}</title>{BASE_CSS}</head>
+    <title>{safe_title}</title>{refresh_tag}{BASE_CSS}</head>
     <body>{BG_DECOR_HTML}{corner_html}<h1>&#9827; Table de poker</h1><div class="sub">{safe_title}</div>
     {render_game_tabs()}
     {body}
@@ -2677,7 +2733,12 @@ def table_view():
       </form>
     </p>
     """
-    return layout(f"Main #{game.hand_no}", body, corner_html=render_corner_leaderboard())
+    any_waiting = any(status == "waiting" for status in RELAY_STATUS.values())
+    return layout(
+        f"Main #{game.hand_no}", body,
+        corner_html=render_corner_leaderboard(),
+        auto_refresh_seconds=3 if any_waiting else None,
+    )
 
 
 # ----------------------------------------------------------------------
