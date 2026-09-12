@@ -162,7 +162,7 @@ def load_relay_config():
                 return cfg
         except (json_module.JSONDecodeError, OSError, UnicodeDecodeError):
             pass
-    return {"relay_url": ""}
+    return {"relay_url": "", "relay_token": ""}
 
 
 def save_relay_config(cfg):
@@ -188,7 +188,9 @@ def ask_relay_for_action(ai_type, message, timeout=90):
 
     _set_relay_status(ai_type, "waiting")
 
-    payload = json_module.dumps({"ai": ai_type, "message": message}).encode("utf-8")
+    payload = json_module.dumps({
+        "ai": ai_type, "message": message, "token": cfg.get("relay_token", ""),
+    }).encode("utf-8")
     req = urllib.request.Request(
         f"{relay_url}/ask",
         data=payload,
@@ -2333,27 +2335,19 @@ def setup():
     return layout("Nouvelle partie", body)
 
 
-AI_PROMPT_TEXT = """Tu vas incarner un ou plusieurs joueurs (bots) dans une partie de Texas Hold'em No-Limit. Plusieurs IA differentes (dont toi) controlent chacune un ou plusieurs bots a cette meme table, face a un joueur humain qui fait lui aussi partie des joueurs. Un script fait office de croupier : au debut de chaque main, il t'envoie un message complet (etat de la table, positions, tapis, et les cartes chiffrees de TES bots uniquement - jamais celles des autres joueurs) ; puis, a chaque tour suivant sur cette meme main, un message BEAUCOUP PLUS COURT ne contenant QUE ce qui est nouveau depuis ton dernier message (nouvelles actions jouees, nouvelle rue le cas echeant). Ce n'est pas un oubli : appuie-toi sur ta memoire de la conversation pour tout ce qui a deja ete dit plus tot (tes cartes, l'etat de depart, la liste de tes bots...), ca reste valable jusqu'a la fin de la main.
+AI_PROMPT_TEXT = """Tu incarnes un ou plusieurs bots dans un Texas Hold'em No-Limit, face a d'autres IA et a un joueur humain qui participent aussi. Un script-croupier t'envoie, en debut de main, un message complet : etat de la table, positions, tapis, la liste de TES bots (marques "(vous)"), et leurs cartes chiffrees uniquement (jamais celles des autres). A chaque tour suivant sur cette meme main, il t'envoie ensuite un message COURT ne contenant que le nouveau depuis ton dernier message (nouvelles actions, nouvelle rue). Ce n'est pas un oubli : garde en memoire tout ce qui precede (cartes, table, liste de TES bots) jusqu'a la fin de la main.
 
 REGLES IMPERATIVES :
 
-1. NE REVELE JAMAIS l'identite de tes cartes cachees dans ta reponse visible, ni en clair, ni par des indices suffisamment precis pour les deviner (evite par exemple d'ecrire "j'ai un brelan" ou de decrire la force reelle de ta main). Le joueur humain participe a la partie et ne doit jamais disposer d'informations que les autres joueurs n'ont pas. Garde tout raisonnement sur la force de ta main strictement interne a ta reflexion, ne l'ecris jamais dans ta reponse.
+1. Ne revele jamais tes cartes ni la force reelle de ta main, ni en clair ni par indice (ex: "j'ai un brelan") : le joueur humain ne doit jamais en savoir plus que les autres joueurs. Garde tout raisonnement sur ta main strictement interne.
 
-2. A chaque tour, ta reponse doit contenir, pour CHAQUE bot que tu controles et qui doit reellement agir a ce tour precis, une ligne (et une seule par bot) exactement dans ce format :
+2. Reponds avec une ligne, format exact "NomDuBot : Action" (ex: Fold / Check / Call 200 / Raise a 600 / All-in a 3400), pour CHAQUE bot A TOI qui doit reellement agir MAINTENANT - aucune ligne si aucun ne doit parler a ce tour. Rien d'autre au format "Nom : ..." : le systeme ignore tout le reste, inutile de recopier le message recu, de le resumer ou d'expliquer.
 
-NomDuBot : Action
+3. N'agis JAMAIS pour un bot qui n'est pas marque "(vous)", ni avant son vrai tour (le message indique toujours qui doit parler). En cas de doute sur l'ordre ou sur qui controle qui, abstiens-toi plutot que de deviner : ca fausserait toute la main.
 
-(exemples valides : Fold / Check / Call 200 / Raise a 600 / All-in a 3400)
+4. Si tu geres plusieurs bots, revois leur liste "(vous)" a chaque tour et n'en oublie aucun, meme si un seul doit parler maintenant.
 
-Le systeme ignore automatiquement toute ligne qui ne correspond pas exactement a ce format "Nom : Action" - inutile donc de recopier le message recu, de le resumer, ou d'ajouter des explications : une ligne d'action nette par bot concerne suffit. N'ecris jamais de ligne "Nom : ..." pour autre chose qu'une vraie action de jeu.
-
-3. OPTIONNEL mais bienvenu : avant ces lignes d'action (donc clairement separee d'elles), tu peux ajouter UNE SEULE phrase courte decrivant l'attitude du joueur au moment de son action (comme un vrai joueur a la table : hesitation, sourire, soupir, air confiant, petite remarque...). Cette attitude peut deliberement NE PAS refleter la vraie force de la main (bluff comportemental) : hesiter avec une main excellente, ou jouer l'assurance avec une main faible. Varie ces attitudes d'une main a l'autre pour ne pas creer de pattern reconnaissable qui trahirait systematiquement tes vraies mains. Garde-la courte : c'est un detail d'ambiance, pas une explication.
-
-4. ATTENTION PARTICULIERE si tu geres PLUSIEURS bots a cette table : le tout premier message de chaque nouvelle main te rappelle explicitement la liste de TOUS tes bots (avec la mention "(vous)"). Les messages suivants sur cette meme main ne la repetent plus (pour rester courts) : garde-la en tete jusqu'a la fin de la main, verifie-la avant de repondre a chaque tour, et n'oublie AUCUN de tes bots meme si un seul d'entre eux doit parler a ce tour precis.
-
-5. NE FAIS JAMAIS agir un bot avant que ce ne soit reellement son tour. Le message que tu recois indique toujours qui doit parler en premier : n'ajoute une action que pour CE joueur precis, jamais pour un joueur qui doit parler plus tard dans l'ordre. Si tu geres plusieurs bots dont un seul doit parler a ce moment, ne fais reagir que celui-la, meme si tu geres aussi l'autre. En cas de doute sur l'ordre exact, ne devine pas : demande confirmation plutot que de faire parler un bot hors tour, cela fausse toute la main.
-
-6. N'ecris JAMAIS de ligne d'action pour un nom de joueur qui n'est pas l'un de TES bots (ceux marques "(vous)" dans le rappel que tu recois). Meme si tu penses savoir ce qu'un autre joueur devrait logiquement faire, ce n'est ni ton role ni ta decision a prendre : chaque IA (ou le joueur humain) ne joue que pour ses propres bots. Une ligne d'action au nom d'un joueur qui n'est pas le tien fausse completement la main et cree des incoherences difficiles a corriger. Si le message ne mentionne aucun de tes bots comme devant agir a ce tour, ne produis simplement aucune ligne d'action.
+5. Optionnel : une phrase courte decrivant l'attitude du bot avant son action (hesitation, sourire, soupir...), qui peut deliberement ne pas refleter sa vraie main (bluff comportemental) - varie-la d'une main a l'autre.
 
 Es-tu prete a commencer ?"""
 
@@ -3053,11 +3047,13 @@ def do_bulk_action():
 def relay_settings():
     if request.method == "POST":
         url = request.form.get("relay_url", "").strip()
-        save_relay_config({"relay_url": url})
+        token = request.form.get("relay_token", "").strip()
+        save_relay_config({"relay_url": url, "relay_token": token})
         return redirect(url_for("relay_settings"))
 
     cfg = load_relay_config()
     current = html.escape(cfg.get("relay_url", ""))
+    current_token = html.escape(cfg.get("relay_token", ""))
     continue_url = url_for("table_view") if game.players else url_for("setup")
     body = f"""
     <div class="card">
@@ -3067,11 +3063,18 @@ def relay_settings():
       une adresse locale du style <code>http://192.168.1.XX:8765</code>,
       trouvable via l'IP affichee au demarrage du serveur sur ton PC.
       Ton telephone et ton PC doivent etre sur le meme reseau Wi-Fi.</p>
-      <p>Cette adresse est memorisee : verifie/modifie-la si besoin (par
-      exemple si ton PC a change d'adresse locale), puis continue.</p>
+      <p>Renseigne aussi le jeton secret (le meme que dans
+      <code>relay_server.py</code>, variable <code>RELAY_TOKEN</code>) :
+      sans lui, le relais refuse toute requete - ca evite qu'un autre
+      appareil sur le meme reseau puisse piloter tes conversations IA.</p>
+      <p>Ces informations sont memorisees : verifie/modifie-les si besoin
+      (par exemple si ton PC a change d'adresse locale), puis continue.</p>
       <form method="post">
         <input type="text" name="relay_url" value="{current}"
                placeholder="http://192.168.1.XX:8765" style="width:100%;">
+        <label style="margin-top:10px; display:block;">Jeton secret</label>
+        <input type="text" name="relay_token" value="{current_token}"
+               placeholder="pokervsia" style="width:100%;">
         <button style="margin-top:12px;">Enregistrer</button>
       </form>
       <p style="margin-top:20px;">
