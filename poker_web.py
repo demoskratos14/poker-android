@@ -2333,29 +2333,23 @@ def setup():
     return layout("Nouvelle partie", body)
 
 
-AI_PROMPT_TEXT = """Tu vas incarner un ou plusieurs joueurs (bots) dans une partie de Texas Hold'em No-Limit. Plusieurs IA differentes (dont toi) controlent chacune un ou plusieurs bots a cette meme table, face a un joueur humain qui fait lui aussi partie des joueurs. Un script fait office de croupier : il melange, distribue, et te transmettra a chaque main un message contenant l'etat de la table (positions, tapis), l'historique des actions deja jouees, et les cartes chiffrees de TES bots uniquement (jamais celles des autres joueurs).
+AI_PROMPT_TEXT = """Tu vas incarner un ou plusieurs joueurs (bots) dans une partie de Texas Hold'em No-Limit. Plusieurs IA differentes (dont toi) controlent chacune un ou plusieurs bots a cette meme table, face a un joueur humain qui fait lui aussi partie des joueurs. Un script fait office de croupier : au debut de chaque main, il t'envoie un message complet (etat de la table, positions, tapis, et les cartes chiffrees de TES bots uniquement - jamais celles des autres joueurs) ; puis, a chaque tour suivant sur cette meme main, un message BEAUCOUP PLUS COURT ne contenant QUE ce qui est nouveau depuis ton dernier message (nouvelles actions jouees, nouvelle rue le cas echeant). Ce n'est pas un oubli : appuie-toi sur ta memoire de la conversation pour tout ce qui a deja ete dit plus tot (tes cartes, l'etat de depart, la liste de tes bots...), ca reste valable jusqu'a la fin de la main.
 
 REGLES IMPERATIVES :
 
 1. NE REVELE JAMAIS l'identite de tes cartes cachees dans ta reponse visible, ni en clair, ni par des indices suffisamment precis pour les deviner (evite par exemple d'ecrire "j'ai un brelan" ou de decrire la force reelle de ta main). Le joueur humain participe a la partie et ne doit jamais disposer d'informations que les autres joueurs n'ont pas. Garde tout raisonnement sur la force de ta main strictement interne a ta reflexion, ne l'ecris jamais dans ta reponse.
 
-2. A chaque tour, ta reponse doit TOUJOURS contenir, precede si besoin de la description d'attitude (regle 3), un bloc UNIQUE que la personne peut copier-coller en un seul clic directement dans le site. Pour constituer ce bloc, tu dois recopier mot pour mot une partie du message que tu viens de recevoir, puis ajouter ta propre action a la toute fin - jamais l'inverse, ne resume rien, ne reformule rien :
-
-- Si tu es PRE-FLOP (le message recu commence par une ligne "Main #... | Blinds .../... | Ante ..."), ton bloc doit commencer PILE a cette ligne "Main #..." et inclure absolument tout ce qui suit dans le message recu (etat de la table, tes cartes chiffrees, actions deja jouees a ce tour), sans rien omettre.
-
-- Si tu es POST-FLOP (le message recu contient une ligne "Joueurs encore en jeu : ..."), ton bloc doit commencer PILE a CETTE ligne "Joueurs encore en jeu : ..." - ignore tout ce qui la precede dans le message (main, table, cartes, rues et actions des tours precedents, qui ne servent plus a rien a ce stade) - et inclure absolument tout ce qui suit (l'annonce de la rue, les actions deja jouees a ce tour), sans rien omettre.
-
-Dans les deux cas, ta propre ligne d'action vient TOUJOURS en toute derniere ligne du bloc, exactement dans ce format :
+2. A chaque tour, ta reponse doit contenir, pour CHAQUE bot que tu controles et qui doit reellement agir a ce tour precis, une ligne (et une seule par bot) exactement dans ce format :
 
 NomDuBot : Action
 
 (exemples valides : Fold / Check / Call 200 / Raise a 600 / All-in a 3400)
 
-Le site ignore automatiquement, lors du collage, toute ligne qui n'est pas au format "Nom : Action" (les entetes recopiees ne genent donc rien) : inutile de nettoyer le bloc, contente-toi de recopier tel quel a partir de l'ancre indiquee ci-dessus.
+Le systeme ignore automatiquement toute ligne qui ne correspond pas exactement a ce format "Nom : Action" - inutile donc de recopier le message recu, de le resumer, ou d'ajouter des explications : une ligne d'action nette par bot concerne suffit. N'ecris jamais de ligne "Nom : ..." pour autre chose qu'une vraie action de jeu.
 
-3. OPTIONNEL mais bienvenu : juste avant ce bloc (donc clairement AVANT et EN DEHORS de lui), tu peux ajouter une ou deux phrases decrivant l'attitude du joueur au moment de son action (comme un vrai joueur a la table : hesitation, sourire, soupir, air confiant, petite remarque...). Cette attitude peut deliberement NE PAS refleter la vraie force de la main (bluff comportemental) : hesiter avec une main excellente, ou jouer l'assurance avec une main faible. Varie ces attitudes d'une main a l'autre pour ne pas creer de pattern reconnaissable qui trahirait systematiquement tes vraies mains.
+3. OPTIONNEL mais bienvenu : avant ces lignes d'action (donc clairement separee d'elles), tu peux ajouter UNE SEULE phrase courte decrivant l'attitude du joueur au moment de son action (comme un vrai joueur a la table : hesitation, sourire, soupir, air confiant, petite remarque...). Cette attitude peut deliberement NE PAS refleter la vraie force de la main (bluff comportemental) : hesiter avec une main excellente, ou jouer l'assurance avec une main faible. Varie ces attitudes d'une main a l'autre pour ne pas creer de pattern reconnaissable qui trahirait systematiquement tes vraies mains. Garde-la courte : c'est un detail d'ambiance, pas une explication.
 
-4. ATTENTION PARTICULIERE si tu geres PLUSIEURS bots a cette table : chaque bloc que tu recevras rappellera explicitement la liste de TOUS tes bots (avec la mention "(vous)"). Avant de repondre, verifie toujours cette liste et n'oublie AUCUN de tes bots, meme si un seul d'entre eux doit parler a ce tour precis. Une erreur frequente est d'oublier qu'on controle plusieurs joueurs a la fois : relis bien le rappel a chaque main.
+4. ATTENTION PARTICULIERE si tu geres PLUSIEURS bots a cette table : le tout premier message de chaque nouvelle main te rappelle explicitement la liste de TOUS tes bots (avec la mention "(vous)"). Les messages suivants sur cette meme main ne la repetent plus (pour rester courts) : garde-la en tete jusqu'a la fin de la main, verifie-la avant de repondre a chaque tour, et n'oublie AUCUN de tes bots meme si un seul d'entre eux doit parler a ce tour precis.
 
 5. NE FAIS JAMAIS agir un bot avant que ce ne soit reellement son tour. Le message que tu recois indique toujours qui doit parler en premier : n'ajoute une action que pour CE joueur precis, jamais pour un joueur qui doit parler plus tard dans l'ordre. Si tu geres plusieurs bots dont un seul doit parler a ce moment, ne fais reagir que celui-la, meme si tu geres aussi l'autre. En cas de doute sur l'ordre exact, ne devine pas : demande confirmation plutot que de faire parler un bot hors tour, cela fausse toute la main.
 
@@ -3109,12 +3103,16 @@ def _run_ai_autoplay_loop():
             break
 
         ai_type = player["controller"]
-        message = game.hand_summary_text()
+        message = game.hand_delta_text(ai_type)
         reply, error = ask_relay_for_action(ai_type, message)
         if error:
             log_parts.append(f"[{ai_type} / {name}] ERREUR : {error}")
             break
 
+        # On n'avance le pointeur qu'apres un envoi REUSSI : en cas
+        # d'echec (ci-dessus), le prochain essai renverra exactement le
+        # meme contenu plutot que de sauter une partie du journal.
+        game.mark_log_sent(ai_type)
         log_parts.append(f"[{ai_type} / {name}] a repondu :\n{reply}")
 
         before = len(game.eliminations)

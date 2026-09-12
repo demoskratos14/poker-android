@@ -446,6 +446,15 @@ class Game:
         self.cash_ai_busts = 0       # nombre d'IA rachetees depuis le debut de CETTE session cash
         self.cash_new_record = False  # True si cash_ai_busts a strictement depasse le record precedent
 
+        # Pour chaque controleur (IA), index dans self.action_log jusqu'ou
+        # son dernier message envoye (via le relais automatique) est deja
+        # alle. Sert a ne lui envoyer, a chaque tour suivant, QUE les
+        # nouvelles lignes depuis son dernier message sur cette main
+        # (voir hand_delta_text) - au lieu de repeter tout l'historique
+        # de la main a chaque fois, ce qui gonflerait inutilement la
+        # conversation (et donc la consommation de quota) au fil des tours.
+        self.sent_log_index = {}
+
     # ---------- persistance ----------
     def _card_to_list(self, card):
         return [card[0], card[1]]
@@ -493,6 +502,7 @@ class Game:
             "cash_over": self.cash_over,
             "cash_ai_busts": self.cash_ai_busts,
             "cash_new_record": self.cash_new_record,
+            "sent_log_index": self.sent_log_index,
         }
         # Ecriture atomique : on ecrit d'abord dans un fichier temporaire
         # puis on le bascule en place avec os.replace(), qui est une
@@ -567,6 +577,7 @@ class Game:
             self.cash_over = data.get("cash_over", False)
             self.cash_ai_busts = data.get("cash_ai_busts", 0)
             self.cash_new_record = data.get("cash_new_record", False)
+            self.sent_log_index = data.get("sent_log_index", {})
             return True
         except (json.JSONDecodeError, OSError, UnicodeDecodeError, KeyError, TypeError, ValueError) as e:
             # Fichier corrompu (arret brutal en cours d'ecriture, disque plein,
@@ -675,6 +686,7 @@ class Game:
         self.cash_over = False
         self.cash_ai_busts = 0
         self.cash_new_record = False
+        self.sent_log_index = {}
 
     def setup_players(self):
         self.players = []
@@ -818,6 +830,7 @@ class Game:
         self.street = "preflop"
         self.hand_complete = False
         self.action_log = []
+        self.sent_log_index = {}
         self.total_contrib = {}
         self.history_stack = []
         self.min_raise = self.big_blind
@@ -974,6 +987,12 @@ class Game:
                 lines.append(f"  - {pname} ({self.positions[pname]}) : {c1code} et {c2code}")
             lines.append(f"L'action commence pre-flop. Premier a parler : {talk_order[0]} ({self.positions[talk_order[0]]}).")
             self.last_blocks[controller] = "\n".join(lines)
+            # Ce controleur vient de recevoir, via ce bloc initial, tout ce
+            # qui est dans self.action_log jusqu'ici (juste l'en-tete "Main
+            # #..." a ce stade) : les prochains messages qu'on lui enverra
+            # sur cette main ne devront donc contenir que ce qui vient
+            # APRES (voir hand_delta_text).
+            self.sent_log_index[controller] = len(self.action_log)
             for pname in arrived:
                 self.find(pname).pop("just_arrived", None)
                 self.find(pname).pop("arrival_reason", None)
@@ -1892,7 +1911,10 @@ class Game:
     # ---------- affichage ----------
     def hand_summary_text(self):
         """Retourne l'historique de la main en cours, au format copiable
-        (identique a celui que vous tapez manuellement pour les autres IA)."""
+        (identique a celui que vous tapez manuellement pour les autres IA).
+        Utilise pour le collage manuel (bloc entier, toujours complet) -
+        voir hand_delta_text() pour la version allegee utilisee par le
+        pilotage automatique via le relais."""
         if not self.action_log:
             return "(aucune action enregistree pour l'instant sur cette main)"
         text = "\n".join(self.action_log)
@@ -1907,6 +1929,37 @@ class Game:
             pos_txt = f" ({pos})" if pos else ""
             text += f"\nProchain a parler : {next_player}{pos_txt}."
         return text
+
+    def hand_delta_text(self, controller):
+        """Version allegee de hand_summary_text(), pensee pour le
+        pilotage automatique via le relais : ne renvoie que les lignes
+        du journal de la main en cours qui n'ont PAS ENCORE ete envoyees
+        a CE controleur precis (voir sent_log_index), au lieu de repeter
+        a chaque tour tout l'historique deja transmis dans les messages
+        precedents de la meme conversation - l'IA le retient deja, la
+        repetition ne fait que gonfler inutilement chaque echange.
+
+        N'avance PAS le pointeur elle-meme : appeler mark_log_sent()
+        seulement apres un envoi reussi, pour pouvoir renvoyer exactement
+        le meme contenu en cas de nouvel essai suite a un echec."""
+        start = self.sent_log_index.get(controller, 0)
+        new_lines = self.action_log[start:]
+        text = "\n".join(new_lines) if new_lines else "(Aucune nouvelle action depuis votre dernier message sur cette main.)"
+        if self.hand_complete:
+            text += "\n(Main terminee.)"
+        elif self.to_act:
+            next_player = self.to_act[0]
+            pos = self.positions.get(next_player, "")
+            pos_txt = f" ({pos})" if pos else ""
+            text += f"\nProchain a parler : {next_player}{pos_txt}."
+        return text
+
+    def mark_log_sent(self, controller):
+        """A appeler juste apres qu'un message construit par
+        hand_delta_text(controller) a ete envoye AVEC SUCCES : avance le
+        pointeur de ce controleur jusqu'au bout du journal actuel, pour
+        que son prochain message ne contienne que ce qui viendra APRES."""
+        self.sent_log_index[controller] = len(self.action_log)
 
     def full_tournament_text(self):
         """Retourne l'historique complet du tournoi (toutes les mains deja
