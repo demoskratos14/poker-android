@@ -760,12 +760,13 @@ def _balance_satellite_tables():
                 # Marque ce joueur comme "fraichement arrive" sur sa nouvelle
                 # table : sert a avertir son IA, dans le bloc de la PROCHAINE
                 # main distribuee sur cette table, qu'elle doit desormais
-                # aussi jouer ce role (voir deal_hand() dans poker_engine.py,
+                # aussi jouer ce role (voir new_hand() dans poker_engine.py,
                 # qui consomme puis efface ce marqueur). Sans effet sur les
                 # tables annexes, qui ne distribuent jamais de main pour de
                 # vrai (elles ne font que miroiter les eliminations) - seule
                 # la table principale (avec le siege humain) le consommera.
                 "just_arrived": True,
+                "arrival_reason": "satellite_merge",
             })
             g_dest.save()
             # Le joueur a change de table : on annule son tapis sur l'ancienne
@@ -882,6 +883,57 @@ def relay_status_dot_html(controller):
         f'style="display:inline-block;width:9px;height:9px;border-radius:50%;'
         f'background:{color};margin-left:5px;vertical-align:middle;"></span>'
     )
+
+
+# ----------------------------------------------------------------------
+# Pilotage automatique des IA en arriere-plan : des qu'une action fait
+# passer la main a un siege IA, on lance tout seul (sans clic) la
+# sequence d'echanges avec le relais, dans un thread separe pour ne
+# jamais bloquer l'affichage. table_view() se recharge automatiquement
+# pendant ce temps (voir auto_refresh_seconds plus bas) pour montrer la
+# progression (voyants rouge -> vert).
+# ----------------------------------------------------------------------
+_autoplay_lock = threading.Lock()
+_autoplay_running = False
+
+
+def _start_autoplay_worker():
+    """Marque un autoplay comme demarre et lance le thread qui l'execute.
+    A n'appeler qu'apres avoir verifie (sous _autoplay_lock) qu'aucun
+    autre autoplay n'est deja en cours."""
+    global _autoplay_running
+    _autoplay_running = True
+
+    def _worker():
+        global _autoplay_running
+        try:
+            _run_ai_autoplay_loop()
+        finally:
+            with _autoplay_lock:
+                _autoplay_running = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _maybe_start_ai_autoplay():
+    """Demarre automatiquement le tour de la prochaine IA a agir, si
+    le relais est configure et qu'aucun autoplay n'est deja en cours.
+    A appeler apres toute action susceptible de faire passer la main a
+    une IA, et au chargement de la table (pour rattraper les cas ou
+    c'est deja au tour d'une IA a l'arrivee sur la page)."""
+    with _autoplay_lock:
+        if _autoplay_running:
+            return
+        if game.hand_complete or not game.to_act:
+            return
+        name = game.to_act[0]
+        player = next((p for p in game.players if p["name"] == name), None)
+        if player is None or player.get("is_human"):
+            return
+        cfg = load_relay_config()
+        if not (cfg.get("relay_url") or "").strip():
+            return
+        _start_autoplay_worker()
 
 
 @app.before_request
@@ -1705,25 +1757,29 @@ BASE_CSS = """
     display:block; font-size:0.68rem; color:var(--gold-soft); margin-top:2px;
   }
 
-  /* -------- Mini classement general, en haut a droite de la PAGE -------- */
-  .corner-leaderboard{
+  /* -------- Petits encarts empiles, en haut a droite de la PAGE -------- */
+  .corner-stack{
     /* Colle en haut a droite du CONTENU de la page (relatif a <body>, qui
     a position:relative), pas de l'ECRAN : il defile normalement avec le
     reste de la page et disparait donc quand on descend, au lieu de
     rester visible en permanence a l'ecran. */
     position:absolute; top:8px; right:8px; z-index:9999; max-width:98px;
+    display:flex; flex-direction:column; gap:5px;
+  }
+  .corner-box{
     background:rgba(8,34,26,0.96); border:1px solid var(--line);
     border-radius:7px; padding:4px 6px;
   }
-  .corner-leaderboard h3{
+  .corner-box h3{
     margin:0 0 2px 0; font-size:0.5rem; color:var(--gold-soft);
     text-transform:uppercase; letter-spacing:0.2px; white-space:nowrap;
   }
-  .corner-leaderboard table{width:100%; font-size:0.52rem;}
-  .corner-leaderboard td, .corner-leaderboard th{
+  .corner-box table{width:100%; font-size:0.52rem;}
+  .corner-box td, .corner-box th{
     padding:1px 2px; border:none; white-space:nowrap;
     overflow:hidden; text-overflow:ellipsis; max-width:44px;
   }
+  .corner-box p{margin:0; font-size:0.52rem; line-height:1.35; white-space:nowrap;}
 </style>
 <script>
 
@@ -1821,7 +1877,23 @@ def layout(title, body, corner_html="", auto_refresh_seconds=None):
     return f"""
     <!DOCTYPE html><html lang="fr"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{safe_title}</title>{refresh_tag}{BASE_CSS}</head>
+    <title>{safe_title}</title>{refresh_tag}{BASE_CSS}
+    <script>
+      // Conserve la position de defilement d'un rafraichissement (via
+      // la balise meta refresh ci-dessus) au suivant : sans ca, chaque
+      // rechargement automatique de la page renvoie tout en haut, ce
+      // qui donne l'impression que la page "part n'importe ou".
+      window.addEventListener('beforeunload', function() {{
+        try {{ sessionStorage.setItem('scrollpos_' + location.pathname, window.scrollY); }} catch (e) {{}}
+      }});
+      window.addEventListener('load', function() {{
+        try {{
+          var y = sessionStorage.getItem('scrollpos_' + location.pathname);
+          if (y !== null) window.scrollTo(0, parseInt(y, 10));
+        }} catch (e) {{}}
+      }});
+    </script>
+    </head>
     <body>{BG_DECOR_HTML}{corner_html}<h1>&#9827; Table de poker</h1><div class="sub">{safe_title}</div>
     {render_game_tabs()}
     {body}
@@ -1830,9 +1902,9 @@ def layout(title, body, corner_html="", auto_refresh_seconds=None):
 
 
 def render_corner_leaderboard():
-    """Petit encart fixe en haut a droite de la page : classement general
-    persistant (tous tournois confondus). Remplace l'ancien emplacement
-    (pleine largeur) du classement general sur la page de la table."""
+    """Petit encart (classement general persistant, tous tournois
+    confondus). Retourne uniquement le contenu interne (voir
+    render_corner_widgets pour le conteneur positionne qui l'englobe)."""
     leaderboard = game.get_leaderboard()
     if not leaderboard:
         return ""
@@ -1841,11 +1913,39 @@ def render_corner_leaderboard():
         for i, (ctrl, pts) in enumerate(leaderboard)
     )
     return f"""
-    <div class="corner-leaderboard">
+    <div class="corner-box">
       <h3>Classement general</h3>
       <table><tr><th>#</th><th>Ctrl</th><th>Pts</th></tr>{rows}</table>
     </div>
     """
+
+
+def render_cash_counter():
+    """Petit encart (uniquement en cash game) : nombre d'IA
+    eliminees-rachetees depuis le debut de CETTE session, et meilleur
+    score jamais atteint (record persistant, tous cash games
+    confondus). Retourne "" hors cash game."""
+    if game.game_type != "cash":
+        return ""
+    best = game.get_cash_best_record()
+    return f"""
+    <div class="corner-box">
+      <h3>Cash game</h3>
+      <p>IA eliminees : <b>{game.cash_ai_busts}</b></p>
+      <p>Record perso : <b>{best}</b></p>
+    </div>
+    """
+
+
+def render_corner_widgets():
+    """Empile, dans un seul conteneur positionne en haut a droite de la
+    page, tous les petits encarts a afficher (classement general,
+    compteur cash game...). Retourne "" si aucun n'a rien a montrer."""
+    parts = [render_corner_leaderboard(), render_cash_counter()]
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    return f'<div class="corner-stack">{"".join(parts)}</div>'
 
 
 def _tournament_overview():
@@ -1989,8 +2089,13 @@ def setup():
         big_blind = int(request.form.get("big_blind", 200))
         ante = int(request.form.get("ante", 10))
         hands_per_level = int(request.form.get("hands_per_level", 10))
+        game_type = request.form.get("game_type", "tournament").strip()
+        if game_type not in ("tournament", "cash"):
+            game_type = "tournament"
         num_tables = int(request.form.get("num_tables", 1) or 1)
         num_tables = max(1, min(num_tables, 20))
+        if game_type == "cash":
+            num_tables = 1  # le cash game est mono-table uniquement (nombre de joueurs fixe)
         name_pool_raw = request.form.get("name_pool", "").strip()
         seat_controllers, human_names = [], {}
         auto_indices = []
@@ -2030,6 +2135,7 @@ def setup():
             small_blind=small_blind, big_blind=big_blind, ante=ante,
             hands_per_level=hands_per_level,
             shared_name_pool=shared_name_pool,
+            game_type=game_type,
         )
         if num_tables > 1:
             spawn_extra_tables(
@@ -2124,6 +2230,22 @@ def setup():
     {manage_ai_html}
     <form method="post">
       <div class="card">
+        <label>Type de partie</label>
+        <select name="game_type" id="game_type" onchange="toggleGameType()">
+          <option value="tournament" selected>Tournoi (elimination definitive, blindes progressives)</option>
+          <option value="cash">Cash game (nombre de joueurs fixe, blindes fixes, IA rachetees automatiquement)</option>
+        </select>
+        <p class="sub" id="cash_explanation" style="display:none; margin:4px 0 0 0;">
+          En cash game, la table garde toujours le meme nombre de joueurs :
+          des qu'un siege IA tombe a 0 jeton, il est immediatement rachete
+          (nouveau nom, meme IA aux commandes) avec un tapis egal a la
+          moyenne de la table. Si c'est VOUS qui etes elimine, la partie
+          s'arrete - un compteur affiche alors combien d'IA vous avez vu
+          passer avant votre propre elimination (record personnel a battre).
+        </p>
+      </div>
+
+      <div class="card">
         <label>Nombre de joueurs a la table</label>
         <input type="number" name="n_players" id="n_players" value="7" min="2" max="10"
                onchange="updateSeats()">
@@ -2132,7 +2254,7 @@ def setup():
       <h2>Structure du tournoi</h2>
       <div id="presets">{preset_cards}</div>
 
-      <div class="card">
+      <div class="card" id="num_tables_card">
         <label>Nombre de tables</label>
         <input type="number" name="num_tables" id="num_tables" value="1" min="1" max="20">
         <p class="sub" style="margin:4px 0 0 0;">
@@ -2143,7 +2265,8 @@ def setup():
           memes IA que celles choisies pour "ma table" (un siege humain y
           est remplace par une de ces IA, puisque vous ne pouvez jouer que
           sur une seule table a la fois). Chaque table apparait ensuite comme
-          un onglet separe en haut de la page.
+          un onglet separe en haut de la page. (Non disponible en cash game :
+          une seule table fixe.)
         </p>
       </div>
 
@@ -2156,8 +2279,10 @@ def setup():
         <input type="number" name="big_blind" id="big_blind" value="200">
         <label>Ante (par joueur)</label>
         <input type="number" name="ante" id="ante" value="10">
-        <label>Nombre de mains avant que les blindes/antes doublent</label>
-        <input type="number" name="hands_per_level" id="hands_per_level" value="10">
+        <div id="hands_per_level_row">
+          <label>Nombre de mains avant que les blindes/antes doublent</label>
+          <input type="number" name="hands_per_level" id="hands_per_level" value="10">
+        </div>
       </div>
 
       <div class="card">
@@ -2194,7 +2319,15 @@ def setup():
         document.getElementById('ante').value = chosen.dataset.ante;
         document.getElementById('hands_per_level').value = chosen.dataset.hpl;
       }}
+      function toggleGameType(){{
+        var isCash = document.getElementById('game_type').value === 'cash';
+        document.getElementById('num_tables_card').style.display = isCash ? 'none' : 'block';
+        document.getElementById('hands_per_level_row').style.display = isCash ? 'none' : 'block';
+        document.getElementById('cash_explanation').style.display = isCash ? 'block' : 'none';
+        if (isCash) {{ document.getElementById('num_tables').value = 1; }}
+      }}
       updateSeats();
+      toggleGameType();
     </script>
     """
     return layout("Nouvelle partie", body)
@@ -2225,6 +2358,8 @@ Le site ignore automatiquement, lors du collage, toute ligne qui n'est pas au fo
 4. ATTENTION PARTICULIERE si tu geres PLUSIEURS bots a cette table : chaque bloc que tu recevras rappellera explicitement la liste de TOUS tes bots (avec la mention "(vous)"). Avant de repondre, verifie toujours cette liste et n'oublie AUCUN de tes bots, meme si un seul d'entre eux doit parler a ce tour precis. Une erreur frequente est d'oublier qu'on controle plusieurs joueurs a la fois : relis bien le rappel a chaque main.
 
 5. NE FAIS JAMAIS agir un bot avant que ce ne soit reellement son tour. Le message que tu recois indique toujours qui doit parler en premier : n'ajoute une action que pour CE joueur precis, jamais pour un joueur qui doit parler plus tard dans l'ordre. Si tu geres plusieurs bots dont un seul doit parler a ce moment, ne fais reagir que celui-la, meme si tu geres aussi l'autre. En cas de doute sur l'ordre exact, ne devine pas : demande confirmation plutot que de faire parler un bot hors tour, cela fausse toute la main.
+
+6. N'ecris JAMAIS de ligne d'action pour un nom de joueur qui n'est pas l'un de TES bots (ceux marques "(vous)" dans le rappel que tu recois). Meme si tu penses savoir ce qu'un autre joueur devrait logiquement faire, ce n'est ni ton role ni ta decision a prendre : chaque IA (ou le joueur humain) ne joue que pour ses propres bots. Une ligne d'action au nom d'un joueur qui n'est pas le tien fausse completement la main et cree des incoherences difficiles a corriger. Si le message ne mentionne aucun de tes bots comme devant agir a ce tour, ne produis simplement aucune ligne d'action.
 
 Es-tu prete a commencer ?"""
 
@@ -2338,6 +2473,8 @@ def do_relay_send_hand():
 def table_view():
     if not game.players:
         return redirect(url_for("setup"))
+
+    _maybe_start_ai_autoplay()
 
     def compute_ranks(players):
         """Classement par tapis, du plus gros au plus petit (ex-aequo = meme rang)."""
@@ -2519,6 +2656,8 @@ def table_view():
     </script>"""
 
     next_to_act = game.to_act[0] if game.to_act else None
+    _hunl = game.hands_until_next_level()
+    level_tag_html = f"<span class='tag'>Prochaine hausse dans {_hunl} main(s)</span>" if _hunl is not None else "<span class='tag'>Cash game (blindes fixes)</span>"
     player_options = "".join(
         f'<option value="{p["name"]}"{" selected" if p["name"] == next_to_act else ""}>{p["name"]}'
         f'{" (prochain a agir)" if p["name"] == next_to_act else ""}</option>'
@@ -2553,6 +2692,20 @@ def table_view():
         <div class="card" style="border:2px solid var(--gold); text-align:center;">
           <h2 style="margin-top:0; color:var(--gold-soft);">&#127942; Tournoi termine !</h2>
           <p>Vainqueur : <b>{game.winner}</b></p>
+        </div>
+        """
+    elif game.cash_over:
+        best = game.get_cash_best_record()
+        record_line = (
+            "<p>&#127775; Nouveau record personnel !</p>"
+            if game.cash_new_record
+            else f"<p>Record personnel a battre : <b>{best}</b></p>"
+        )
+        tournament_banner = f"""
+        <div class="card" style="border:2px solid var(--gold); text-align:center;">
+          <h2 style="margin-top:0; color:var(--gold-soft);">Cash game termine</h2>
+          <p>Vous avez ete elimine apres avoir vu <b>{game.cash_ai_busts}</b> IA se faire eliminer.</p>
+          {record_line}
         </div>
         """
 
@@ -2670,7 +2823,7 @@ def table_view():
         <span class="tag">Pot : {game.pot}</span>
         <span class="tag">Blinds {game.small_blind}/{game.big_blind}</span>
         <span class="tag">Ante {game.ante}</span>
-        <span class="tag">Prochaine hausse dans {game.hands_until_next_level()} main(s)</span>
+        {level_tag_html}
         {"<span class='tag'>Prochain a agir : " + next_to_act + "</span>" if next_to_act else ""}
       </div>
       {last_action_html}
@@ -2678,31 +2831,19 @@ def table_view():
       {"<p><b>Vos cartes :</b></p>" + my_cards_html if my_cards_html else ""}
       {poker_table_html}
     </div>
+
+    <div class="card">
+      <h2 style="margin-top:0">Journal detaille</h2>
+      <pre class="log">{LAST_LOG or "(aucune action recente)"}</pre>
+    </div>
+
     {action_form_html}
     {tournament_overview_html}
     {showdown_html}
 
     <div class="card">
-      <h2 style="margin-top:0">Actions rapides</h2>
-      {controller_links}
-      <a class="btn secondary" href="{url_for('show_tournament_history')}">Historique complet du tournoi</a>
-    </div>
-
-    <div class="card">
-      <h2 style="margin-top:0">Pilotage automatique des IA</h2>
-      <p>Fait jouer directement les IA dont c'est le tour, via ton PC relais,
-      sans copier-coller manuel.</p>
-      <form method="post" action="{url_for('do_ai_autoplay')}">
-        <button>Faire jouer les IA</button>
-      </form>
-      <p style="margin-top:12px;">
-        <a class="btn secondary" href="{url_for('relay_settings')}">Configurer le relais IA (PC)</a>
-      </p>
-    </div>
-
-    <div class="card">
       <h2 style="margin-top:0">Nouvelle main / rue</h2>
-      <form method="post" action="{url_for('do_new_hand')}"><button{" disabled" if game.tournament_over else ""}>Nouvelle main</button></form>
+      <form method="post" action="{url_for('do_new_hand')}"><button{" disabled" if (game.tournament_over or game.cash_over) else ""}>Nouvelle main</button></form>
       <form method="post" action="{url_for('do_undo')}"><button class="secondary">&#8617; Annuler la derniere action</button></form>
     </div>
 
@@ -2721,8 +2862,24 @@ def table_view():
     </div>
 
     <div class="card">
-      <h2 style="margin-top:0">Journal detaille</h2>
-      <pre class="log">{LAST_LOG or "(aucune action recente)"}</pre>
+      <details>
+        <summary style="cursor:pointer; font-weight:bold;">Actions manuelles / secours (le tour des IA se joue normalement tout seul)</summary>
+        <div style="margin-top:14px;">
+          {controller_links}
+          <a class="btn secondary" href="{url_for('show_tournament_history')}">Historique complet du tournoi</a>
+        </div>
+        <div style="margin-top:14px;">
+          <p>Le tour de chaque IA se declenche normalement automatiquement.
+          Ce bouton ne sert qu'a forcer l'essai maintenant si, pour une
+          raison quelconque, ca ne s'est pas fait tout seul.</p>
+          <form method="post" action="{url_for('do_ai_autoplay')}">
+            <button class="secondary">Forcer le tour des IA maintenant</button>
+          </form>
+          <p style="margin-top:12px;">
+            <a class="btn secondary" href="{url_for('relay_settings')}">Configurer le relais IA (PC)</a>
+          </p>
+        </div>
+      </details>
     </div>
 
     <p>
@@ -2736,8 +2893,8 @@ def table_view():
     any_waiting = any(status == "waiting" for status in RELAY_STATUS.values())
     return layout(
         f"Main #{game.hand_no}", body,
-        corner_html=render_corner_leaderboard(),
-        auto_refresh_seconds=3 if any_waiting else None,
+        corner_html=render_corner_widgets(),
+        auto_refresh_seconds=2 if any_waiting else None,
     )
 
 
@@ -2754,6 +2911,7 @@ def do_new_hand():
     # chiffrees).
     if getattr(game, "last_blocks", None):
         _relay_broadcast_async(dict(game.last_blocks), "Nouvelle main (cartes)")
+    _maybe_start_ai_autoplay()
     return redirect(url_for("table_view"))
 
 
@@ -2780,6 +2938,7 @@ def show_tournament_history():
 @app.route("/next_street", methods=["POST"])
 def do_next_street():
     run_captured(game.next_street)
+    _maybe_start_ai_autoplay()
     return redirect(url_for("table_view"))
 
 
@@ -2827,6 +2986,7 @@ def do_showdown():
     before = len(game.eliminations)
     before_complete = game.hand_complete
     run_captured(lambda: (game.showdown(), _sync_and_balance_after_hand(before, before_complete)))
+    _maybe_start_ai_autoplay()
     return redirect(url_for("table_view"))
 
 
@@ -2854,6 +3014,7 @@ def do_action():
     # apply_action() peut avoir declenche un showdown automatique en interne
     # (check_auto_progress) sans jamais passer par la route /showdown.
     _sync_and_balance_after_hand(before, before_complete)
+    _maybe_start_ai_autoplay()
     return redirect(url_for("table_view"))
 
 
@@ -2890,6 +3051,7 @@ def do_bulk_action():
     before_complete = game.hand_complete
     run_captured(apply_action_lines, block)
     _sync_and_balance_after_hand(before, before_complete)
+    _maybe_start_ai_autoplay()
     return redirect(url_for("table_view"))
 
 
@@ -2926,8 +3088,7 @@ def relay_settings():
     return layout("Relais IA", body)
 
 
-@app.route("/ai_autoplay", methods=["POST"])
-def do_ai_autoplay():
+def _run_ai_autoplay_loop():
     """Fait jouer automatiquement, via le relais PC, tous les bots IA
     dont c'est le tour, a la suite, jusqu'a ce que ce soit au tour
     d'un joueur humain, que la main soit terminee, ou qu'une erreur
@@ -2968,7 +3129,19 @@ def do_ai_autoplay():
             )
             break
 
-    LAST_LOG = "\n\n".join(log_parts) if log_parts else "(aucune IA n'avait a jouer)"
+    with _relay_log_lock:
+        LAST_LOG = "\n\n".join(log_parts) if log_parts else "(aucune IA n'avait a jouer)"
+
+
+@app.route("/ai_autoplay", methods=["POST"])
+def do_ai_autoplay():
+    """Bouton de secours : force le declenchement immediat du tour des
+    IA. Les tours des IA se declenchent normalement tout seuls (voir
+    _maybe_start_ai_autoplay) - ce bouton n'est utile que si, pour une
+    raison quelconque, ce declenchement automatique n'a pas eu lieu."""
+    with _autoplay_lock:
+        if not _autoplay_running:
+            _start_autoplay_worker()
     return redirect(url_for("table_view"))
 
 

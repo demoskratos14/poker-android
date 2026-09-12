@@ -54,6 +54,11 @@ LEADERBOARD_FILE = "poker_leaderboard.json"
 # concurrents (voir _leaderboard_lock ci-dessous).
 LEADERBOARD_LOCK_FILE = LEADERBOARD_FILE + ".lock"
 
+# Fichier du meilleur score cash game jamais atteint (nombre d'IA
+# eliminees-rachetees par le joueur humain avant sa propre elimination),
+# PARTAGE entre toutes les parties, comme LEADERBOARD_FILE.
+CASH_RECORD_FILE = "poker_cash_best.json"
+
 
 @contextlib.contextmanager
 def _leaderboard_lock(timeout=10.0, poll=0.05):
@@ -429,6 +434,18 @@ class Game:
         # de jetons (tapis, mises, pot) cote web, afin qu'un montant donne soit toujours
         # represente par la meme taille, independamment de ce que font les autres joueurs.
 
+        # ---------- mode cash game ----------
+        # "tournament" (comportement historique : elimination definitive,
+        # hausse progressive des blindes, classement de fin de tournoi) ou
+        # "cash" (nombre de joueurs FIXE : tout siege IA qui tombe a 0 est
+        # immediatement rachete avec un tapis egal a la moyenne de la table ;
+        # blindes fixes ; la partie se termine seulement quand le joueur
+        # humain lui-meme est elimine).
+        self.game_type = "tournament"
+        self.cash_over = False       # True des que le joueur humain est elimine en cash game
+        self.cash_ai_busts = 0       # nombre d'IA rachetees depuis le debut de CETTE session cash
+        self.cash_new_record = False  # True si cash_ai_busts a strictement depasse le record precedent
+
     # ---------- persistance ----------
     def _card_to_list(self, card):
         return [card[0], card[1]]
@@ -472,6 +489,10 @@ class Game:
             "starting_num_players": self.starting_num_players,
             "hand_complete": self.hand_complete,
             "action_log": self.action_log,
+            "game_type": self.game_type,
+            "cash_over": self.cash_over,
+            "cash_ai_busts": self.cash_ai_busts,
+            "cash_new_record": self.cash_new_record,
         }
         # Ecriture atomique : on ecrit d'abord dans un fichier temporaire
         # puis on le bascule en place avec os.replace(), qui est une
@@ -542,6 +563,10 @@ class Game:
                 max((p["stack"] for p in self.players), default=0)
             )
             self.starting_num_players = data.get("starting_num_players", len(self.players))
+            self.game_type = data.get("game_type", "tournament")
+            self.cash_over = data.get("cash_over", False)
+            self.cash_ai_busts = data.get("cash_ai_busts", 0)
+            self.cash_new_record = data.get("cash_new_record", False)
             return True
         except (json.JSONDecodeError, OSError, UnicodeDecodeError, KeyError, TypeError, ValueError) as e:
             # Fichier corrompu (arret brutal en cours d'ecriture, disque plein,
@@ -564,7 +589,7 @@ class Game:
     # ---------- setup ----------
     def setup_players_web(self, stack, name_pool_raw, seat_controllers, human_names,
                            small_blind=100, big_blind=200, ante=10, hands_per_level=10,
-                           shared_name_pool=None):
+                           shared_name_pool=None, game_type="tournament"):
         """Version non-interactive de setup_players(), utilisee par l'interface web.
         seat_controllers : liste de codes ('0'/'1'/'2'/'3' ou nom libre), un par siege.
         human_names : dict {index_siege: nom} pour les sieges humains.
@@ -574,8 +599,13 @@ class Game:
         d'en reconstruire un nouveau. Indispensable pour un tournoi
         multi-table (voir spawn_extra_tables dans poker_web.py) : sans cela,
         chaque table repiocherait independamment dans la meme liste par
-        defaut et on obtiendrait des doublons de noms entre tables."""
+        defaut et on obtiendrait des doublons de noms entre tables.
+
+        game_type : "tournament" (par defaut, comportement historique) ou
+        "cash" (nombre de joueurs fixe, blindes fixes, rachat automatique
+        des sieges IA elimines - voir _process_cash_rebuys)."""
         self.players = []
+        self.game_type = game_type
         if shared_name_pool is not None:
             name_pool = shared_name_pool
         elif name_pool_raw and name_pool_raw.strip():
@@ -642,6 +672,9 @@ class Game:
         self.to_act = []
         self.seat_order = []
         self.street_order = []
+        self.cash_over = False
+        self.cash_ai_busts = 0
+        self.cash_new_record = False
 
     def setup_players(self):
         self.players = []
@@ -728,6 +761,8 @@ class Game:
         return [p["name"] for p in rotated if p["stack"] > 0]
 
     def maybe_increase_blinds(self):
+        if self.game_type == "cash":
+            return  # blindes fixes en cash game, par definition
         hpl = max(1, self.hands_per_level)
         if self.hand_no > 0 and self.hand_no % hpl == 0:
             self.small_blind *= 2
@@ -737,7 +772,8 @@ class Game:
 
     def hands_until_next_level(self):
         """Renvoie le nombre de mains restantes avant la prochaine hausse
-        automatique des blindes/antes (voir maybe_increase_blinds).
+        automatique des blindes/antes (voir maybe_increase_blinds), ou None
+        en cash game (blindes fixes, la notion n'a pas de sens).
 
         maybe_increase_blinds() est appelee juste apres l'incrementation de
         self.hand_no, au tout debut de new_hand() : au moment ou ce numero
@@ -749,6 +785,8 @@ class Game:
           main jouee) : la prochaine hausse est dans un cycle complet, hpl
           mains plus tard.
         """
+        if self.game_type == "cash":
+            return None
         hpl = max(1, self.hands_per_level)
         remainder = self.hand_no % hpl
         return hpl - remainder if remainder != 0 else hpl
@@ -758,6 +796,10 @@ class Game:
         if self.tournament_over:
             print(f"Le tournoi est termine ! Vainqueur : {self.winner}. "
                   "Impossible de lancer une nouvelle main.")
+            return
+        if self.cash_over:
+            print(f"Cash game termine : vous avez ete elimine apres avoir vu "
+                  f"{self.cash_ai_busts} IA se faire eliminer. Impossible de lancer une nouvelle main.")
             return
         if self.hand_no > 0:
             self.advance_button_auto()
@@ -892,14 +934,30 @@ class Game:
             # l'arrivee (les mains suivantes redeviennent des blocs normaux).
             arrived = [pname for pname in names if self.find(pname).get("just_arrived")]
             if arrived:
+                # L'explication varie selon la raison de l'arrivee (fusion
+                # d'une table annexe en tournoi multi-table, ou rachat
+                # automatique apres elimination en cash game) - meme
+                # mecanique de fond (just_arrived), texte adapte au contexte.
+                reasons = {self.find(pname).get("arrival_reason") for pname in arrived}
+                if reasons == {"cash_rebuy"}:
+                    contexte = (
+                        f"{'a' if len(arrived) == 1 else 'ont'} ete elimine{'s' if len(arrived) > 1 else ''} "
+                        f"puis immediatement rachete{'s' if len(arrived) > 1 else ''} (cash game : le nombre de "
+                        f"joueurs a la table reste toujours le meme, avec un tapis egal a la moyenne actuelle "
+                        f"de la table)"
+                    )
+                else:
+                    contexte = (
+                        "vien" + ("nent" if len(arrived) > 1 else "t") + " de rejoindre cette table "
+                        "(une table annexe du tournoi multi-table vient de fermer et ses joueurs "
+                        "restants ont ete redistribues)"
+                    )
                 lines.append(
-                    f"*** NOUVEAU JOUEUR SOUS VOTRE CONTROLE : {', '.join(arrived)} "
-                    f"vien{'nent' if len(arrived) > 1 else 't'} de rejoindre cette table "
-                    f"(une table annexe du tournoi multi-table vient de fermer et ses joueurs "
-                    f"restants ont ete redistribues). Vous devez desormais jouer son/leur role "
-                    f"EN PLUS de ceux que vous controliez deja a cette table, s'il y en a. "
-                    f"Comme pour vos autres joueurs, ses/leurs cartes chiffrees vous sont "
-                    f"revelees ci-dessous : ne les oubliez pas dans vos actions a venir. ***"
+                    f"*** NOUVEAU JOUEUR SOUS VOTRE CONTROLE : {', '.join(arrived)} {contexte}. "
+                    f"Vous devez desormais jouer son/leur role EN PLUS de ceux que vous controliez "
+                    f"deja a cette table, s'il y en a. Comme pour vos autres joueurs, ses/leurs "
+                    f"cartes chiffrees vous sont revelees ci-dessous : ne les oubliez pas dans vos "
+                    f"actions a venir. ***"
                 )
             if len(names) > 1:
                 lines.append(f"*** RAPPEL : vous controlez {len(names)} joueurs a cette table : "
@@ -918,6 +976,7 @@ class Game:
             self.last_blocks[controller] = "\n".join(lines)
             for pname in arrived:
                 self.find(pname).pop("just_arrived", None)
+                self.find(pname).pop("arrival_reason", None)
 
         self.write_blocks_to_files()
         self.save()
@@ -1449,21 +1508,80 @@ class Game:
         self.save()
         self.print_stacks()
 
-        # suivi des eliminations (pour le classement inter-tournois)
-        already_out = {e["name"] for e in self.eliminations}
-        for pl in self.players:
-            if pl["stack"] <= 0 and pl["name"] not in already_out:
-                self.eliminations.append({"name": pl["name"], "hand_no": self.hand_no})
+        # suivi des eliminations (pour le classement inter-tournois) et
+        # detection de fin de partie - le comportement differe totalement
+        # entre un tournoi (elimination definitive) et un cash game (rachat
+        # automatique des sieges IA, nombre de joueurs toujours fixe).
+        if self.game_type == "cash":
+            self._process_cash_rebuys()
+        else:
+            already_out = {e["name"] for e in self.eliminations}
+            for pl in self.players:
+                if pl["stack"] <= 0 and pl["name"] not in already_out:
+                    self.eliminations.append({"name": pl["name"], "hand_no": self.hand_no})
 
-        # detection de fin de tournoi
-        remaining = [pl for pl in self.players if pl["stack"] > 0]
-        if len(remaining) == 1:
-            self.tournament_over = True
-            self.winner = remaining[0]["name"]
-            banner = f"\n*** TOURNOI TERMINE ! Vainqueur : {self.winner} avec {remaining[0]['stack']} jetons. ***"
-            print(banner)
-            self.save()
-            self.record_tournament_ranking()
+            # detection de fin de tournoi
+            remaining = [pl for pl in self.players if pl["stack"] > 0]
+            if len(remaining) == 1:
+                self.tournament_over = True
+                self.winner = remaining[0]["name"]
+                banner = f"\n*** TOURNOI TERMINE ! Vainqueur : {self.winner} avec {remaining[0]['stack']} jetons. ***"
+                print(banner)
+                self.save()
+                self.record_tournament_ranking()
+
+    def _process_cash_rebuys(self):
+        """Mode cash game uniquement : quand un siege tombe a 0 jeton, il
+        est immediatement rachete pour garder un nombre de joueurs FIXE a
+        la table :
+          - Siege IA : rachete automatiquement sous un nouveau nom (la
+            MEME IA en prend le controle), avec un tapis egal a la
+            moyenne des tapis des joueurs encore solvables. Le marqueur
+            just_arrived (mecanique deja utilisee pour le multi-table)
+            previent l'IA, dans le tout prochain bloc de main, qu'elle
+            controle desormais ce nouveau joueur. Le compteur
+            cash_ai_busts (le "record a battre" affiche au joueur humain)
+            est incremente a chaque rachat.
+          - Siege humain : pas de rachat automatique - la partie s'arrete
+            pour le joueur humain (cash_over=True), et si le nombre d'IA
+            eliminees pendant cette session bat le record persistant
+            (get_cash_best_record), il est mis a jour."""
+        busted = [pl for pl in self.players if pl["stack"] <= 0]
+        if not busted:
+            return
+
+        ai_busted = [pl for pl in busted if not pl.get("is_human")]
+        human_busted = any(pl.get("is_human") for pl in busted)
+
+        if ai_busted:
+            survivors = [pl["stack"] for pl in self.players if pl["stack"] > 0]
+            avg_stack = round(sum(survivors) / len(survivors)) if survivors else self.starting_stack
+            used_names = {pl["name"] for pl in self.players}
+            pool = build_default_name_pool()
+            for pl in ai_busted:
+                new_name = next((n for n in pool if n not in used_names), None)
+                if new_name is None:
+                    new_name = f"{pl['controller']}_{self.hand_no}_{len(used_names)}"
+                used_names.add(new_name)
+                old_name = pl["name"]
+                pl["name"] = new_name
+                pl["stack"] = avg_stack
+                pl["just_arrived"] = True
+                pl["arrival_reason"] = "cash_rebuy"
+                self.cash_ai_busts += 1
+                print(f"\n*** {old_name} ({pl['controller']}) est elimine et rachete sous le nom "
+                      f"{new_name}, avec {avg_stack} jetons (tapis moyen de la table). ***")
+
+        if human_busted:
+            self.cash_over = True
+            previous_best = self.get_cash_best_record()
+            self.cash_new_record = self.cash_ai_busts > previous_best
+            if self.cash_new_record:
+                self._save_cash_best_record(self.cash_ai_busts)
+            print(f"\n*** Cash game termine : vous etes elimine apres avoir vu {self.cash_ai_busts} "
+                  f"IA se faire eliminer-racheter. ***")
+
+        self.save()
 
     # ---------- synchronisation multi-table (tables annexes IA) ----------
     @staticmethod
@@ -1747,6 +1865,29 @@ class Game:
         liste de tuples (controleur, points)."""
         board = self._load_leaderboard()
         return sorted(board.items(), key=lambda x: -x[1])
+
+    # ---------- record cash game (persistant, multi-parties) ----------
+    def get_cash_best_record(self):
+        """Renvoie le meilleur score cash game jamais atteint (nombre
+        d'IA eliminees-rachetees par le joueur humain avant sa propre
+        elimination), tous parties confondues. 0 si aucun record n'a
+        encore ete etabli ou si le fichier est illisible/absent."""
+        if not os.path.exists(CASH_RECORD_FILE):
+            return 0
+        try:
+            with open(CASH_RECORD_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return int(data.get("best", 0)) if isinstance(data, dict) else 0
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError, TypeError):
+            return 0
+
+    def _save_cash_best_record(self, value):
+        tmp_path = CASH_RECORD_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"best": value}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, CASH_RECORD_FILE)
 
     # ---------- affichage ----------
     def hand_summary_text(self):
